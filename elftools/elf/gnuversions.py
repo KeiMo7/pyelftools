@@ -11,7 +11,7 @@ from __future__ import annotations
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from ..common.exceptions import ELFError
+from ..common.exceptions import ELFError, ELFParseError
 from ..common.utils import elf_assert, struct_parse
 from .dynamic import DynamicSection
 from .sections import Section, Symbol
@@ -47,6 +47,7 @@ class Version:
     """
     def __init__(self, entry: Container, name: str | None = None) -> None:
         self.entry = entry
+        # None means the name could not be resolved; '' is a real empty name.
         self.name = name
 
     def __getitem__(self, name: str) -> Any:
@@ -62,8 +63,9 @@ class VersionAuxiliary:
         Similarly to Section objects, allows dictionary-like access to the
         verdaux/vernaux entry
     """
-    def __init__(self, entry: Container, name: str) -> None:
+    def __init__(self, entry: Container, name: str | None) -> None:
         self.entry = entry
+        # None means the name could not be resolved; '' is a real empty name.
         self.name = name
 
     def __getitem__(self, name: str) -> Any:
@@ -80,7 +82,7 @@ class GNUVersionSection(Section):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         stringtable: StringTableSection,
         field_prefix: str,
@@ -111,21 +113,55 @@ class GNUVersionSection(Section):
         count: int,
     ) -> Iterator[VersionAuxiliary]:
         """ Yield all auxiliary entries of a version entry
+
+            Each auxiliary entry is checked against the section bounds before
+            it is read; a damaged link is reported with its index instead of
+            letting adjacent bytes be parsed as a version.
         """
         name_field = self._field_name('name', auxiliary=True)
         next_field = self._field_name('next', auxiliary=True)
+        entry_size = self.version_auxiliaries_struct.sizeof()
+        section_end = self['sh_offset'] + self['sh_size']
 
-        for _ in range(count):
+        for i in range(count):
+            self._check_version_entry(
+                entry_offset, entry_size, section_end, i,
+                'version auxiliary entry')
             entry = struct_parse(
                         self.version_auxiliaries_struct,
                         self.stream,
                         stream_pos=entry_offset)
 
-            name = self.stringtable.get_string(entry[name_field])
+            name = self.stringtable.get_string_lenient(entry[name_field])
             version_aux = VersionAuxiliary(entry, name)
             yield version_aux
 
             entry_offset += entry[next_field]
+
+    def _check_version_entry(
+        self,
+        entry_offset: int,
+        entry_size: int,
+        section_end: int,
+        index: int,
+        structure: str,
+    ) -> None:
+        """ Reject a version entry outside the section before reading it.
+
+            The bounds check uses header fields only; it never seeks or reads,
+            so a rejection cannot trigger a second error.
+        """
+        section_start = self['sh_offset']
+        if entry_offset < section_start or entry_offset + entry_size > section_end:
+            available = max(0, section_end - entry_offset)
+            raise ELFParseError(
+                f'{structure} {index} at offset {entry_offset} is outside the '
+                f'version section of {self["sh_size"]} bytes',
+                structure=structure,
+                index=index,
+                expected=entry_size,
+                actual=min(entry_size, available),
+            )
 
     def iter_versions(self) -> Iterator[tuple[Version, Iterator[VersionAuxiliary]]]:
         """ Yield all the version entries in the section
@@ -136,8 +172,12 @@ class GNUVersionSection(Section):
         count_field = self._field_name('cnt')
         next_field = self._field_name('next')
 
+        entry_size = self.version_struct.sizeof()
+        section_end = self['sh_offset'] + self['sh_size']
         entry_offset = self['sh_offset']
-        for _ in range(self.num_versions()):
+        for index in range(self.num_versions()):
+            self._check_version_entry(
+                entry_offset, entry_size, section_end, index, 'version entry')
             entry = struct_parse(
                 self.version_struct,
                 self.stream,
@@ -164,7 +204,7 @@ class GNUVerNeedSection(GNUVersionSection):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         stringtable: StringTableSection,
     ) -> None:
@@ -189,7 +229,7 @@ class GNUVerNeedSection(GNUVersionSection):
 
     def iter_versions(self) -> Iterator[tuple[Version, Iterator[VersionAuxiliary]]]:
         for verneed, vernaux in super().iter_versions():
-            verneed.name = self.stringtable.get_string(verneed['vn_file'])
+            verneed.name = self.stringtable.get_string_lenient(verneed['vn_file'])
             yield verneed, vernaux
 
     def get_version(self, index: int) -> tuple[Version, VersionAuxiliary] | None:
@@ -212,7 +252,7 @@ class GNUVerDefSection(GNUVersionSection):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         stringtable: StringTableSection,
     ) -> None:
@@ -240,7 +280,7 @@ class GNUVerSymSection(Section):
     def __init__(
             self,
             header: Container,
-            name: str,
+            name: str | None,
             elffile: ELFFile,
             symboltable: SymbolTableSection,
     ) -> None:
@@ -250,6 +290,8 @@ class GNUVerSymSection(Section):
     def num_symbols(self) -> int:
         """ Number of symbols in the table
         """
+        if self['sh_entsize'] == 0:
+            return 0
         return self['sh_size'] // self['sh_entsize']
 
     def get_symbol(self, n: int) -> Symbol:
@@ -257,6 +299,17 @@ class GNUVerSymSection(Section):
             It begins at 1 and not 0 since the first entry is used to
             store the current version of the syminfo table
         """
+        num_symbols = self.num_symbols()
+        if n < 0 or n >= num_symbols:
+            raise ELFParseError(
+                f'versym index {n} is outside the {num_symbols} entries in '
+                'the table',
+                structure='version symbol table',
+                index=n,
+                first_invalid_index=num_symbols,
+                declared_count=num_symbols,
+                available_count=num_symbols,
+            )
         # Grab the symbol's entry from the stream
         entry_offset = self['sh_offset'] + n * self['sh_entsize']
         entry = struct_parse(

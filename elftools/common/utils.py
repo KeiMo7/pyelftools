@@ -54,7 +54,7 @@ def struct_parse(struct: Construct, stream: IO[bytes], stream_pos: int | None = 
     if stream_pos is not None:
         try:
             stream.seek(stream_pos)
-        except (OverflowError, ValueError) as e:
+        except (OverflowError, ValueError, OSError) as e:
             raise ELFParseError(f'Invalid seek offset {stream_pos}') from e
     try:
         return struct.parse_stream(stream)
@@ -75,12 +75,15 @@ def parse_cstring_from_stream(stream: IO[bytes], stream_pos: int | None = None) 
     if stream_pos is not None:
         try:
             stream.seek(stream_pos)
-        except (OverflowError, ValueError) as e:
+        except (OverflowError, ValueError, OSError) as e:
             raise ELFParseError(f'Invalid seek offset {stream_pos}') from e
     CHUNKSIZE = 64
     chunks = []
     while True:
-        chunk, sep, _tail = stream.read(CHUNKSIZE).partition(b'\x00')
+        try:
+            chunk, sep, _tail = stream.read(CHUNKSIZE).partition(b'\x00')
+        except (OverflowError, ValueError, OSError) as e:
+            raise ELFParseError('Could not read a string from the stream') from e
         chunks.append(chunk)
         if sep:
             return b''.join(chunks)
@@ -88,23 +91,98 @@ def parse_cstring_from_stream(stream: IO[bytes], stream_pos: int | None = None) 
             return None
 
 
-def check_file_range(offset: int, size: int, file_size: int) -> None:
+def parse_cstring_in_range(
+    stream: IO[bytes],
+    start: int,
+    end: int,
+    *,
+    structure: str = 'string table',
+    index: int | None = None,
+) -> bytes | None:
+    """ Parse a NUL-terminated string that must lie entirely in [start, end).
+
+        This never reads past ``end``, so a corrupt string offset cannot pick
+        up bytes belonging to an adjacent section.  Returns None if ``start``
+        is outside the range or the string is not terminated within it.
+    """
+    if start < 0 or start >= end:
+        return None
+    try:
+        stream.seek(start)
+        chunks = []
+        remaining = end - start
+        while remaining > 0:
+            chunk = stream.read(min(64, remaining))
+            if not chunk:
+                return None
+            remaining -= len(chunk)
+            head, sep, _tail = chunk.partition(b'\x00')
+            chunks.append(head)
+            if sep:
+                return b''.join(chunks)
+        return None
+    except (OverflowError, ValueError, OSError) as e:
+        raise ELFParseError(
+            'Could not read a string from the stream',
+            structure=structure,
+            index=index,
+        ) from e
+
+
+def check_file_range(
+    offset: int,
+    size: int,
+    file_size: int,
+    *,
+    structure: str | None = None,
+    index: int | None = None,
+) -> None:
     """ Reject a byte range outside the file before seeking or allocating.
     """
     if offset < 0 or size < 0 or offset > file_size or size > file_size - offset:
+        what = structure or 'file range'
         raise ELFParseError(
-            f'File range at offset {offset} with size {size} exceeds file size {file_size}')
+            f'{what} at offset {offset} with size {size} exceeds file size {file_size}',
+            structure=structure,
+            index=index,
+            expected=size if size >= 0 else None,
+            actual=max(0, file_size - offset) if offset >= 0 else 0,
+        )
 
 
-def stream_read(stream: IO[bytes], offset: int, size: int) -> bytes:
+def stream_read(
+    stream: IO[bytes],
+    offset: int,
+    size: int,
+    *,
+    structure: str | None = None,
+    index: int | None = None,
+) -> bytes:
     """ Read an entire file-backed range, checking its bounds before reading.
     """
-    stream.seek(0, os.SEEK_END)
-    check_file_range(offset, size, stream.tell())
-    stream.seek(offset)
-    data = stream.read(size)
+    try:
+        stream.seek(0, os.SEEK_END)
+        file_size = stream.tell()
+    except (OverflowError, ValueError, OSError) as e:
+        raise ELFParseError('Could not determine the stream size') from e
+    check_file_range(offset, size, file_size, structure=structure, index=index)
+    try:
+        stream.seek(offset)
+        data = stream.read(size)
+    except (OverflowError, ValueError, OSError) as e:
+        raise ELFParseError(
+            f'Could not read {size} bytes at offset {offset}',
+            structure=structure,
+            index=index,
+        ) from e
     if len(data) != size:
-        raise ELFParseError(f'Expected {size} bytes at offset {offset}, found {len(data)}')
+        raise ELFParseError(
+            f'Expected {size} bytes at offset {offset}, found {len(data)}',
+            structure=structure,
+            index=index,
+            expected=size,
+            actual=len(data),
+        )
     return data
 
 

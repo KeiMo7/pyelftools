@@ -8,6 +8,7 @@
 #-------------------------------------------------------------------------------
 from __future__ import annotations
 
+import sys
 import zlib
 from collections import defaultdict
 from functools import cached_property
@@ -19,12 +20,13 @@ from ..common.exceptions import ELFCompressionError, ELFParseError
 from ..common.utils import (
     check_file_range,
     elf_assert,
-    parse_cstring_from_stream,
+    parse_cstring_in_range,
     stream_read,
     struct_parse,
 )
 from .constants import SH_FLAGS
 from .notes import iter_notes
+from .report import StructureRejection, TableScan
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -41,7 +43,14 @@ class Section:
          > sec = Section(...)
          > sec['sh_type']  # section type
     """
-    def __init__(self, header: Container, name: str, elffile: ELFFile) -> None:
+    # Upper bound on a buffer materialized from a declared size that is not
+    # backed by file data (NOBITS sections and decompression output). Without
+    # it a corrupt size field could make the parser allocate gigabytes from a
+    # tiny, truncated sample. Legitimate sections are far smaller; callers
+    # that genuinely need more can raise this limit.
+    MAX_MATERIALIZED_SIZE = 1 << 30
+
+    def __init__(self, header: Container, name: str | None, elffile: ELFFile) -> None:
         self.header = header
         self.name = name
         self.elffile = elffile
@@ -54,7 +63,12 @@ class Section:
             # of the decompressed data.
             check_file_range(self['sh_offset'], self['sh_size'], self.elffile.stream_len)
             if self['sh_size'] < self.structs.Elf_Chdr.sizeof():
-                raise ELFCompressionError('Compressed section is too small for its header')
+                raise ELFCompressionError(
+                    'Compressed section is too small for its header',
+                    structure='compressed section',
+                    expected=self.structs.Elf_Chdr.sizeof(),
+                    actual=self['sh_size'],
+                )
             header = struct_parse(self.structs.Elf_Chdr,
                                   self.stream,
                                   stream_pos=self['sh_offset'])
@@ -94,13 +108,38 @@ class Section:
 
         Note that data is decompressed if the stored section data is
         compressed.
+
+        All bounds are checked before a byte is read or an output buffer is
+        allocated, and every failure is reported as :class:`ELFParseError`
+        (or its :class:`ELFCompressionError` subclass).
         """
         # If this section is NOBITS, there is no data. provide a dummy answer
         if self.header['sh_type'] == 'SHT_NOBITS':
-            try:
-                return b'\0'*self.data_size
-            except OverflowError as e:
-                raise ELFParseError(f'NOBITS section size {self.data_size} is too large') from e
+            # A declared size beyond what a bytes object can represent is
+            # rejected before any allocation; the natural OverflowError is
+            # chained for callers that inspect the cause.
+            if self.data_size > sys.maxsize:
+                try:
+                    b'\0' * self.data_size
+                except OverflowError as e:
+                    raise ELFParseError(
+                        f'NOBITS section size {self.data_size} is too large',
+                        structure='NOBITS section',
+                        expected=self.data_size,
+                        actual=0,
+                    ) from e
+            # Never materialize more NOBITS data than the parser allows: the
+            # declared size is not bounded by the file at all, so a corrupt
+            # field must not turn into a huge allocation.
+            if self.data_size > self.MAX_MATERIALIZED_SIZE:
+                raise ELFParseError(
+                    f'NOBITS section size {self.data_size} is too large to '
+                    'materialize',
+                    structure='NOBITS section',
+                    expected=self.data_size,
+                    actual=0,
+                )
+            return b'\0' * self.data_size
 
         # Section zero can store extended numbering in sh_size, not file data.
         if self.header['sh_type'] == 'SHT_NULL':
@@ -114,23 +153,57 @@ class Section:
                 # compression header until the end of the section.
                 hdr_size: int = self.structs.Elf_Chdr.sizeof()
                 compressed = stream_read(
-                    self.stream, self['sh_offset'] + hdr_size, self['sh_size'] - hdr_size)
+                    self.stream, self['sh_offset'] + hdr_size,
+                    self['sh_size'] - hdr_size, structure='compressed section')
 
                 decomp = zlib.decompressobj()
-                result = decomp.decompress(compressed, self.data_size)
+                # Bound the produced buffer independently of the declared
+                # size: a corrupt declaration (or a decompression bomb) must
+                # not be allowed to allocate without limit.
+                limit = min(self.data_size, self.MAX_MATERIALIZED_SIZE + 1)
+                try:
+                    result = decomp.decompress(compressed, limit)
+                except (zlib.error, OverflowError, ValueError) as e:
+                    raise ELFCompressionError(
+                        'Compressed section stream is corrupt',
+                        structure='compressed section',
+                    ) from e
+                if len(result) > self.MAX_MATERIALIZED_SIZE:
+                    raise ELFCompressionError(
+                        f'Decompressed data exceeds the {self.MAX_MATERIALIZED_SIZE}'
+                        '-byte materialization limit',
+                        structure='compressed section',
+                        expected=self._decompressed_size,
+                        actual=len(result),
+                    )
+                # A stream that is cut off before its end marker is corrupt
+                # even if the bytes produced so far happen to match the
+                # declared size.
+                if not decomp.eof:
+                    raise ELFCompressionError(
+                        'Compressed section stream is truncated',
+                        structure='compressed section',
+                        expected=self._decompressed_size,
+                        actual=len(result),
+                    )
             elif isinstance(c_type, int):
                 raise ELFCompressionError(
-                    f'Unknown compression type: {c_type:#0x}'
+                    f'Unknown compression type: {c_type:#0x}',
+                    structure='compressed section',
                 )
             else:
                 raise ELFCompressionError(
-                    f'Unknown compression type: {c_type!r}'
+                    f'Unknown compression type: {c_type!r}',
+                    structure='compressed section',
                 )
 
             if len(result) != self._decompressed_size:
                 raise ELFCompressionError(
                     f'Decompressed data is {len(result)} bytes long, should be {self._decompressed_size} bytes'
-                    ' long'
+                    ' long',
+                    structure='compressed section',
+                    expected=self._decompressed_size,
+                    actual=len(result),
                 )
         else:
             result = stream_read(self.stream, self['sh_offset'], self._decompressed_size)
@@ -174,10 +247,55 @@ class StringTableSection(Section):
     """
     def get_string(self, offset: int) -> str:
         """ Get the string stored at the given offset in this string table.
+
+        Raises :class:`ELFParseError` if ``offset`` is outside the table or
+        the string is not terminated inside it. The lookup never reads past
+        the end of the table, so a corrupt offset cannot pick up bytes from an
+        adjacent section.
         """
         table_offset = self['sh_offset']
-        s = parse_cstring_from_stream(self.stream, table_offset + offset)
-        return s.decode('utf-8', errors='replace') if s else ''
+        table_end = table_offset + self['sh_size']
+        if offset < 0 or table_offset + offset >= table_end:
+            raise ELFParseError(
+                f'string offset {offset} is outside the string table of '
+                f'{self["sh_size"]} bytes',
+                structure='string table',
+                index=offset,
+                expected=self['sh_size'],
+                actual=0,
+            )
+        s = parse_cstring_in_range(
+            self.stream, table_offset + offset, table_end,
+            structure='string table', index=offset)
+        if s is None:
+            raise ELFParseError(
+                f'string at offset {offset} is not terminated within the '
+                f'string table of {self["sh_size"]} bytes',
+                structure='string table',
+                index=offset,
+                expected=self['sh_size'],
+                actual=table_end - (table_offset + offset),
+            )
+        return s.decode('utf-8', errors='replace')
+
+    def get_string_lenient(self, offset: int) -> str | None:
+        """ Like :meth:`get_string`, but return None instead of raising when
+            the string cannot be resolved.
+
+            An empty string is a real, empty name; None means the name is
+            unavailable. Callers can therefore tell ``"no name"`` from ``"name
+            could not be read"``.
+        """
+        table_offset = self['sh_offset']
+        table_end = table_offset + self['sh_size']
+        if offset < 0 or table_offset + offset >= table_end:
+            return None
+        s = parse_cstring_in_range(
+            self.stream, table_offset + offset, table_end,
+            structure='string table', index=offset)
+        if s is None:
+            return None
+        return s.decode('utf-8', errors='replace')
 
 
 class SymbolTableIndexSection(Section):
@@ -190,7 +308,7 @@ class SymbolTableIndexSection(Section):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         symboltable: Container,
     ) -> None:
@@ -202,6 +320,20 @@ class SymbolTableIndexSection(Section):
             The section contains an array of Elf32_word values with one entry
             for every symbol in the associated symbol table.
         """
+        if self['sh_entsize'] > 0:
+            count = self['sh_size'] // self['sh_entsize']
+        else:
+            count = 0
+        if n < 0 or n >= count:
+            raise ELFParseError(
+                f'section index entry {n} is outside the {count} entries in '
+                'the table',
+                structure='symbol table index section',
+                index=n,
+                first_invalid_index=count,
+                declared_count=count,
+                available_count=count,
+            )
         return struct_parse(self.elffile.structs.Elf_word(''), self.stream,
                             self['sh_offset'] + n * self['sh_entsize'])
 
@@ -213,16 +345,28 @@ class SymbolTableSection(Section):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         stringtable: StringTableSection,
     ) -> None:
         super().__init__(header, name, elffile)
         self.stringtable = stringtable
-        elf_assert(self['sh_entsize'] > 0,
-                f'Expected entry size of section {name!r} to be > 0')
-        elf_assert(self['sh_size'] % self['sh_entsize'] == 0,
-                f'Expected section size to be a multiple of entry size in section {name!r}')
+        if self['sh_entsize'] == 0:
+            raise ELFParseError(
+                f'symbol table section {name!r} declares an entry size of 0',
+                structure='symbol table',
+                expected=1,
+                actual=0,
+            )
+        if self['sh_size'] % self['sh_entsize'] != 0:
+            raise ELFParseError(
+                f'symbol table section {name!r} has a size of '
+                f'{self["sh_size"]} bytes that is not a multiple of its '
+                f'{self["sh_entsize"]}-byte entry size',
+                structure='symbol table',
+                expected=self['sh_entsize'],
+                actual=self['sh_size'] % self['sh_entsize'],
+            )
 
     def num_symbols(self) -> int:
         """ Number of symbols in the table
@@ -231,15 +375,53 @@ class SymbolTableSection(Section):
 
     def get_symbol(self, n: int) -> Symbol:
         """ Get the symbol at index #n from the table (Symbol object)
+
+            Raises :class:`ELFParseError` if #n is outside the table, before
+            reading anything: an out-of-range index must never turn adjacent
+            section bytes into a plausible-looking symbol.
         """
-        # Grab the symbol's entry from the stream
+        num_symbols = self.num_symbols()
+        if n < 0 or n >= num_symbols:
+            raise ELFParseError(
+                f'symbol index {n} is outside the {num_symbols} symbols in '
+                'the table',
+                structure='symbol table',
+                index=n,
+                first_invalid_index=num_symbols,
+                declared_count=num_symbols,
+                available_count=num_symbols,
+            )
+        # Grab the symbol's entry from the stream, after checking that the
+        # whole entry lies inside both the table and the file.
+        entry_size = self.structs.Elf_Sym.sizeof()
         entry_offset = self['sh_offset'] + n * self['sh_entsize']
+        table_end = self['sh_offset'] + self['sh_size']
+        if entry_offset + entry_size > table_end:
+            raise ELFParseError(
+                f'symbol {n} at offset {entry_offset} does not fit in the '
+                f'{self["sh_size"]}-byte symbol table',
+                structure='symbol table',
+                index=n,
+                expected=entry_size,
+                actual=table_end - entry_offset,
+            )
+        file_len = getattr(self.elffile, 'stream_len', None)
+        if file_len is not None and entry_offset + entry_size > file_len:
+            raise ELFParseError(
+                f'symbol {n} at offset {entry_offset} is truncated: expected '
+                f'{entry_size} bytes, found {max(0, file_len - entry_offset)}',
+                structure='symbol table',
+                index=n,
+                expected=entry_size,
+                actual=max(0, file_len - entry_offset),
+            )
         entry = struct_parse(
             self.structs.Elf_Sym,
             self.stream,
             stream_pos=entry_offset)
-        # Find the symbol name in the associated string table
-        name = self.stringtable.get_string(entry['st_name'])
+        # Find the symbol name in the associated string table. A name that
+        # cannot be resolved is reported as None, never as an empty string.
+        name = self.stringtable.get_string_lenient(entry['st_name'])
         return Symbol(entry, name)
 
     def get_symbol_by_name(self, name: str) -> list[Symbol] | None:
@@ -251,10 +433,30 @@ class SymbolTableSection(Section):
 
     @cached_property
     def _symbol_name_map(self) -> dict[str, list[int]]:
-        smap = defaultdict(list)
+        smap: dict[str, list[int]] = defaultdict(list)
         for i, sym in enumerate(self.iter_symbols()):
-            smap[sym.name].append(i)
+            if sym.name is not None:
+                smap[sym.name].append(i)
         return smap
+
+    def iter_symbols_lenient(self) -> TableScan[Symbol]:
+        """ Enumerate every usable symbol, together with the reason each
+            rejected one is unavailable.
+
+            A single damaged entry does not abort the scan; the returned
+            :class:`TableScan` yields the usable symbols and records one
+            :class:`StructureRejection` per rejected index.
+        """
+        declared = self.num_symbols()
+        symbols: list[Symbol] = []
+        rejections: list[StructureRejection] = []
+        for i in range(declared):
+            try:
+                symbols.append(self.get_symbol(i))
+            except ELFParseError as error:
+                rejections.append(StructureRejection(
+                    structure='symbol table', index=i, error=error))
+        return TableScan(tuple(symbols), tuple(rejections), declared, declared)
 
     def iter_symbols(self) -> Iterator[Symbol]:
         """ Yield all the symbols in the table
@@ -270,8 +472,9 @@ class Symbol:
         Similarly to Section objects, allows dictionary-like access to the
         symbol entry.
     """
-    def __init__(self, entry: Container, name: str) -> None:
+    def __init__(self, entry: Container, name: str | None) -> None:
         self.entry = entry
+        # None means the name could not be resolved; '' is a real empty name.
         self.name = name
 
     def __getitem__(self, name: str) -> Any:
@@ -292,7 +495,7 @@ class SUNWSyminfoTableSection(Section):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         symboltable: SymbolTableSection,
     ) -> None:
@@ -302,6 +505,8 @@ class SUNWSyminfoTableSection(Section):
     def num_symbols(self) -> int:
         """ Number of symbols in the table
         """
+        if self['sh_entsize'] == 0:
+            return 0
         return self['sh_size'] // self['sh_entsize'] - 1
 
     def get_symbol(self, n: int) -> Symbol:
@@ -309,6 +514,17 @@ class SUNWSyminfoTableSection(Section):
             It begins at 1 and not 0 since the first entry is used to
             store the current version of the syminfo table.
         """
+        num_symbols = self.num_symbols()
+        if n < 1 or n > num_symbols:
+            raise ELFParseError(
+                f'syminfo index {n} is outside the {num_symbols} entries in '
+                'the table',
+                structure='syminfo table',
+                index=n,
+                first_invalid_index=num_symbols + 1,
+                declared_count=num_symbols,
+                available_count=num_symbols,
+            )
         # Grab the symbol's entry from the stream
         entry_offset = self['sh_offset'] + n * self['sh_entsize']
         entry = struct_parse(
@@ -345,8 +561,26 @@ class StabSection(Section):
         """
         offset: int = self['sh_offset']
         size: int = self['sh_size']
+        entry_size = self.structs.Elf_Stabs.sizeof()
+        file_len = getattr(self.elffile, 'stream_len', None)
+        if file_len is not None and offset + size > file_len:
+            raise ELFParseError(
+                f'stab section of {size} bytes at offset {offset} extends '
+                f'past the end of the file',
+                structure='stab section',
+                expected=size,
+                actual=max(0, file_len - offset),
+            )
         end = offset + size
         while offset < end:
+            if entry_size <= 0 or offset + entry_size > end:
+                raise ELFParseError(
+                    f'stab entry at offset {offset} does not fit in the '
+                    f'{size}-byte section',
+                    structure='stab section',
+                    expected=entry_size,
+                    actual=end - offset,
+                )
             stabs = struct_parse(
                 self.structs.Elf_Stabs,
                 self.stream,
@@ -496,7 +730,7 @@ class AttributesSection(Section):
     """
     subsection = AttributesSubsection
 
-    def __init__(self, header: Container, name: str, elffile: ELFFile) -> None:
+    def __init__(self, header: Container, name: str | None, elffile: ELFFile) -> None:
         super().__init__(header, name, elffile)
 
         fv: int = struct_parse(self.structs.Elf_byte('format_version'),

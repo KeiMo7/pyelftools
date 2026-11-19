@@ -16,7 +16,12 @@ from functools import cached_property
 from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any
 
-from ..common.exceptions import ELFError, ELFParseError
+from ..common.exceptions import (
+    ELFCompressionError,
+    ELFError,
+    ELFParseError,
+    ELFUnparsableFileError,
+)
 from ..common.utils import elf_assert, struct_parse
 from ..dwarf.dwarf_util import _file_crc32
 from ..dwarf.dwarfinfo import DebugSectionDescriptor, DwarfConfig, DWARFInfo
@@ -26,6 +31,7 @@ from .dynamic import DynamicSection, DynamicSegment
 from .gnuversions import GNUVerDefSection, GNUVerNeedSection, GNUVerSymSection
 from .hash import ELFHashSection, GNUHashSection
 from .relocation import RelocationHandler, RelocationSection, RelrRelocationSection
+from .report import StructureRejection, TableScan
 from .sections import (
     ARMAttributesSection,
     NoteSection,
@@ -45,9 +51,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from collections.abc import Container as TContainer
     from types import TracebackType
-    from typing import Self
+    from typing import Self, TypeVar
 
     from ..construct.lib.container import Container
+
+    _T = TypeVar('_T')
 
 
 class ELFFile:
@@ -89,8 +97,14 @@ class ELFFile:
         stream_loader: Callable[[str], IO[bytes]] | None = None,
     ) -> None:
         self.stream = stream
-        self.stream.seek(0, io.SEEK_END)
-        self.stream_len = self.stream.tell()
+        try:
+            self.stream.seek(0, io.SEEK_END)
+            self.stream_len = self.stream.tell()
+        except (OverflowError, ValueError, OSError) as e:
+            raise ELFUnparsableFileError(
+                'Could not determine the size of the ELF stream',
+                structure='file',
+            ) from e
 
         self._identify_file()
         self.structs = ELFStructs(
@@ -105,6 +119,12 @@ class ELFFile:
                 self['e_ident']['EI_OSABI'])
         self.stream.seek(0)
         self.e_ident_raw = self.stream.read(16)
+
+        # Validation state for the section and program header tables. Filled
+        # in lazily by _section_table_capacity / _segment_table_capacity; the
+        # result only depends on the file bytes.
+        self._section_table_capacity_info: tuple[int, int] | None = None
+        self._segment_table_capacity_info: tuple[int, int] | None = None
 
         self.stream_loader = stream_loader
 
@@ -165,14 +185,238 @@ class ELFFile:
             return section_header['sh_size']
         return self['e_shnum']
 
+    def section_table_capacity(self) -> tuple[int, int]:
+        """ Number of section header entries the file can hold.
+
+            Returns a ``(declared, available)`` tuple: the entry count the ELF
+            header claims and the number of whole entries that actually fit in
+            the file after ``e_shoff``. When ``declared > available`` the
+            table is unusable from entry ``available`` on; earlier entries
+            remain enumerable.
+
+            The check is done from the header fields alone, before any entry
+            is read.
+        """
+        if self._section_table_capacity_info is None:
+            available = self._table_capacity(
+                self['e_shoff'], self['e_shentsize'],
+                self.structs.Elf_Shdr.sizeof(), 'section header table')
+            self._section_table_capacity_info = (self._declared_section_count(), available)
+        return self._section_table_capacity_info
+
+    def segment_table_capacity(self) -> tuple[int, int]:
+        """ Number of program header entries the file can hold.
+
+            See :meth:`section_table_capacity` for the meaning of the returned
+            ``(declared, available)`` tuple.
+        """
+        if self._segment_table_capacity_info is None:
+            available = self._table_capacity(
+                self['e_phoff'], self['e_phentsize'],
+                self.structs.Elf_Phdr.sizeof(), 'program header table')
+            self._segment_table_capacity_info = (self._declared_segment_count(), available)
+        return self._segment_table_capacity_info
+
+    def _declared_section_count(self) -> int:
+        """ Entry count claimed by the ELF header, including extended
+            numbering from entry 0. Raises ELFParseError if entry 0 itself is
+            unavailable.
+        """
+        if self['e_shoff'] == 0:
+            return 0
+        if self['e_shnum'] == 0:
+            # Extended numbering: the count lives in sh_size of entry 0.
+            return int(self._read_extended_section_header()['sh_size'])
+        return int(self['e_shnum'])
+
+    def _declared_segment_count(self) -> int:
+        """ Entry count claimed by the ELF header, including the PN_XNUM
+            extended form. Raises ELFParseError if that information is
+            unavailable.
+        """
+        if self['e_phnum'] < 0xffff:
+            return int(self['e_phnum'])
+        # PN_XNUM: the count lives in sh_info of section header 0.
+        return int(self._read_extended_section_header()['sh_info'])
+
+    def _read_extended_section_header(self) -> Container:
+        """ Read section header 0 directly, for the extended numbering fields.
+
+            This deliberately bypasses the ordinary entry lookup: its result
+            (the declared count) is needed by table-level validation, so it
+            must not depend on it.
+        """
+        stream_pos = self['e_shoff']
+        entry_size = self.structs.Elf_Shdr.sizeof()
+        self._check_entry_bytes(
+            stream_pos, entry_size, 0, 'section header table')
+        return struct_parse(
+            self.structs.Elf_Shdr, self.stream, stream_pos=stream_pos)
+
+    def _table_capacity(
+        self,
+        offset: int,
+        entsize: int,
+        entry_size: int,
+        structure: str,
+    ) -> int:
+        """ Number of whole entries of ``entry_size`` bytes at ``offset``.
+
+            Returns 0 if the table does not start within the file. Raises
+            :class:`ELFParseError` if an entry size was declared but it is too
+            small to hold one entry.
+        """
+        if offset == 0:
+            return 0
+        if offset < 0 or offset > self.stream_len:
+            return 0
+        if entsize < entry_size:
+            raise ELFParseError(
+                f'{structure} declares an entry size of {entsize} bytes, '
+                f'smaller than the {entry_size} bytes an entry requires',
+                structure=structure,
+                expected=entry_size,
+                actual=entsize,
+            )
+        return (self.stream_len - offset) // entsize
+
+    def _check_table_prefix(
+        self,
+        n: int,
+        declared: int,
+        available: int,
+        structure: str,
+    ) -> None:
+        """ Reject table entry #n that lies outside the file's capacity.
+
+        Entry indices below ``available`` are usable; a declared count that
+        merely disagrees with the capacity does not prevent reading the
+        usable prefix.
+        """
+        if 0 <= n < available:
+            return
+        if n >= available:
+            if declared <= available:
+                detail = f'only {declared} entries are declared'
+            else:
+                detail = (f'the file has room for {available} entries but '
+                          f'{declared} were declared')
+        else:
+            detail = 'negative entry index'
+        # An entry whose start is inside the file but whose bytes are cut off
+        # is a damaged item: report the shortfall in bytes, not just counts.
+        if 0 <= n:
+            entry_offset = self._entry_offset(n, structure)
+            entry_size = self._entry_size(structure)
+            if 0 <= entry_offset < self.stream_len:
+                available_bytes = self.stream_len - entry_offset
+                if available_bytes < entry_size:
+                    raise ELFParseError(
+                        f'{structure} entry {n} at offset {entry_offset} is '
+                        f'truncated: expected {entry_size} bytes, found '
+                        f'{available_bytes}',
+                        structure=structure,
+                        index=n,
+                        expected=entry_size,
+                        actual=available_bytes,
+                        first_invalid_index=available,
+                        declared_count=declared,
+                        available_count=available,
+                    )
+        raise ELFParseError(
+            f'{structure} entry {n} is not available: {detail}',
+            structure=structure,
+            index=n,
+            first_invalid_index=available,
+            declared_count=declared,
+            available_count=available,
+        )
+
+    def _entry_offset(self, n: int, structure: str) -> int:
+        if structure == 'program header table':
+            return self._segment_offset(n)
+        return self._section_offset(n)
+
+    def _entry_size(self, structure: str) -> int:
+        if structure == 'program header table':
+            return self.structs.Elf_Phdr.sizeof()
+        return self.structs.Elf_Shdr.sizeof()
+
     def get_section(self, n: int, type: TContainer[str] | None = None) -> Section:
         """ Get the section at index #n from the file (Section object or a
             subclass)
+
+            Raises :class:`ELFParseError` if entry #n is outside the section
+            header table's capacity or its header is truncated.
         """
         section_header = self._get_section_header(n)
         if type and section_header.sh_type not in type:
             raise ELFError("Unexpected section type {}, expected {}".format(section_header['sh_type'], type))
         return self._make_section(section_header)
+
+    def classify_section(self, n: int) -> tuple[Section | None, StructureRejection | None]:
+        """ Get section #n without raising for a malformed entry.
+
+            Returns ``(section, None)`` on success, or ``(None, rejection)``
+            with the reason the entry is unavailable. This is the single-item
+            counterpart of :meth:`iter_sections_lenient`, and both judge an
+            entry identically.
+        """
+        try:
+            return self.get_section(n), None
+        except ELFParseError as error:
+            return None, StructureRejection(
+                structure='section header table', index=n, error=error)
+
+    def iter_sections_lenient(self, type: str | None = None) -> TableScan[Section]:
+        """ Enumerate every usable section, together with the reason each
+            rejected one is unavailable.
+
+            Unlike :meth:`iter_sections`, entries that cannot be read do not
+            abort the scan: the returned :class:`TableScan` yields the usable
+            prefix and records a :class:`StructureRejection` for a damaged
+            entry. ``truncated_at`` marks the first entry lost to a table the
+            file cannot hold; that tail is reported once, not per index, so an
+            absurd declared count cannot amplify memory or work.
+        """
+        declared, available = self.section_table_capacity()
+        return self._scan_table(
+            declared, available, self.get_section, 'section header table', type,
+            lambda section: section['sh_type'])
+
+    def _scan_table(
+        self,
+        declared: int,
+        available: int,
+        getter: Callable[[int], _T],
+        structure: str,
+        type: str | None,
+        get_type: Callable[[_T], str | int],
+    ) -> TableScan[_T]:
+        entries: list[_T] = []
+        rejections: list[StructureRejection] = []
+        # Only whole entries inside the file are candidates. Anything beyond
+        # ``available`` is one truncation of the table, reported once below.
+        for i in range(min(declared, available)):
+            try:
+                entry = getter(i)
+            except ELFParseError as error:
+                rejections.append(StructureRejection(
+                    structure=structure, index=i, error=error))
+                continue
+            if type is None or get_type(entry) == type:
+                entries.append(entry)
+        truncated_at = None
+        if declared > available:
+            truncated_at = available
+            try:
+                self._check_table_prefix(
+                    available, declared, available, structure)
+            except ELFParseError as error:
+                rejections.append(StructureRejection(
+                    structure=structure, index=available, error=error))
+        return TableScan(tuple(entries), tuple(rejections), declared, available,
+                         truncated_at)
 
     def _get_linked_symtab_section(self, n: int) -> SymbolTableSection:
         """ Get the section at index #n from the file, throws
@@ -222,6 +466,10 @@ class ELFFile:
             given type. The parameter value must be a string containing the
             name of the type as defined in the ELF specification, e.g.
             'SHT_SYMTAB'.
+
+            Raises :class:`ELFParseError` at the first entry the file cannot
+            hold. To keep the usable prefix of a truncated table, use
+            :meth:`iter_sections_lenient`.
         """
         for i in range(self.num_sections()):
             section = self.get_section(i)
@@ -238,16 +486,41 @@ class ELFFile:
         # (0xffff). The actual number of program header table entries
         # is contained in the sh_info field of the section header at
         # index 0.
-        if self['e_phnum'] < 0xffff:
-            return self['e_phnum']
-        else:
-            return self.get_section(0)['sh_info']
+        # Use the same extended-count lookup as segment_table_capacity, so
+        # both paths give one deterministic verdict for the same bytes.
+        return self._declared_segment_count()
 
     def get_segment(self, n: int) -> Segment:
         """ Get the segment at index #n from the file (Segment object)
+
+            Raises :class:`ELFParseError` if entry #n is outside the program
+            header table's capacity or its header is truncated.
         """
         segment_header = self._get_segment_header(n)
         return self._make_segment(segment_header)
+
+    def iter_segments_lenient(self, type: str | None = None) -> TableScan[Segment]:
+        """ Enumerate every usable segment, together with the reason each
+            rejected one is unavailable.
+
+            See :meth:`iter_sections_lenient`; the judgement for the program
+            header table is the same as for the section header table.
+        """
+        declared, available = self.segment_table_capacity()
+        return self._scan_table(
+            declared, available, self.get_segment, 'program header table', type,
+            lambda segment: segment['p_type'])
+
+    def classify_segment(self, n: int) -> tuple[Segment | None, StructureRejection | None]:
+        """ Get segment #n without raising for a malformed entry.
+
+            The single-item counterpart of :meth:`iter_segments_lenient`.
+        """
+        try:
+            return self.get_segment(n), None
+        except ELFParseError as error:
+            return None, StructureRejection(
+                structure='program header table', index=n, error=error)
 
     def iter_segments(self, type: str | None = None) -> Iterator[Segment]:
         """ Yield all the segments in the file. If the optional |type|
@@ -255,6 +528,10 @@ class ELFFile:
             given type. The parameter value must be a string containing the
             name of the type as defined in the ELF specification, e.g.
             'PT_LOAD'.
+
+            Raises :class:`ELFParseError` at the first entry the file cannot
+            hold. To keep the usable prefix of a truncated table, use
+            :meth:`iter_segments_lenient`.
         """
         for i in range(self.num_segments()):
             segment = self.get_segment(i)
@@ -678,19 +955,57 @@ class ELFFile:
                 self.elfclass = 32
             elif ei_class == b'\x02':
                 self.elfclass = 64
+            elif len(ei_class) != 1:
+                raise ELFUnparsableFileError(
+                    'ELF identification is truncated: the class byte is missing',
+                    structure='ELF header',
+                    expected=16,
+                    actual=4,
+                )
             else:
-                raise ELFError(f'Invalid EI_CLASS {ei_class!r}')
+                raise ELFUnparsableFileError(
+                    f'Invalid EI_CLASS {ei_class!r}', structure='ELF header')
 
             ei_data = self.stream.read(1)
             if ei_data == b'\x01':
                 self.little_endian = True
             elif ei_data == b'\x02':
                 self.little_endian = False
+            elif len(ei_data) != 1:
+                raise ELFUnparsableFileError(
+                    'ELF identification is truncated: the data-encoding byte '
+                    'is missing',
+                    structure='ELF header',
+                    expected=16,
+                    actual=5,
+                )
             else:
-                raise ELFError(f'Invalid EI_DATA {ei_data!r}')
-        except Exception:
+                raise ELFUnparsableFileError(
+                    f'Invalid EI_DATA {ei_data!r}', structure='ELF header')
+
+            # EI_VERSION is the first field after the identification bytes we
+            # already consumed. A file truncated before it cannot be parsed at
+            # all, not merely in one structure.
+            ei_version = self.stream.read(1)
+            if len(ei_version) != 1:
+                raise ELFUnparsableFileError(
+                    'ELF identification is truncated: the version byte is missing',
+                    structure='ELF header',
+                    expected=16,
+                    actual=6,
+                )
+        except ELFUnparsableFileError:
             self.stream.seek(0)
             raise
+        except ELFError:
+            self.stream.seek(0)
+            raise
+        except (OverflowError, ValueError, OSError) as e:
+            self.stream.seek(0)
+            raise ELFUnparsableFileError(
+                'Could not read the ELF identification bytes',
+                structure='ELF header',
+            ) from e
 
     def _section_offset(self, n: int) -> int:
         """ Compute the offset of section #n in the file
@@ -723,24 +1038,69 @@ class ELFFile:
 
     def _get_section_header(self, n: int) -> Container:
         """ Find the header of section #n, parse it and return the struct
+
+            Table-level bounds are checked before the entry is read, so an
+            entry at or beyond the file's capacity is rejected without
+            touching the stream. An entry that starts inside the file but is
+            itself truncated is rejected as a damaged item.
         """
+        declared, available = self.section_table_capacity()
+        self._check_table_prefix(n, declared, available, 'section header table')
 
         stream_pos = self._section_offset(n)
-        if stream_pos > self.stream_len:
-            msg = f"Reading section {n} at offset {stream_pos} past EOF {self.stream_len}"
-            raise ELFParseError(msg)
-
+        entry_size = self.structs.Elf_Shdr.sizeof()
+        self._check_entry_bytes(
+            stream_pos, entry_size, n, 'section header table')
         return struct_parse(
             self.structs.Elf_Shdr,
             self.stream,
             stream_pos=stream_pos)
 
-    def _get_section_name(self, section_header: Container) -> str:
+    def _check_entry_bytes(
+        self,
+        offset: int,
+        entry_size: int,
+        n: int,
+        structure: str,
+    ) -> None:
+        """ Reject a table entry that is only partially inside the file.
+
+            The bounds check uses the file length only; it never reads from
+            the stream.
+        """
+        if offset < 0 or offset > self.stream_len:
+            raise ELFParseError(
+                f'{structure} entry {n} starts at offset {offset}, outside '
+                f'the file of {self.stream_len} bytes',
+                structure=structure,
+                index=n,
+                expected=entry_size,
+                actual=0,
+            )
+        if offset + entry_size > self.stream_len:
+            raise ELFParseError(
+                f'{structure} entry {n} at offset {offset} is truncated: '
+                f'expected {entry_size} bytes, found {self.stream_len - offset}',
+                structure=structure,
+                index=n,
+                expected=entry_size,
+                actual=self.stream_len - offset,
+            )
+
+    def _get_section_name(self, section_header: Container) -> str | None:
         """ Given a section header, find this section's name in the file's
             string table
+
+            Returns None when the name cannot be resolved (the offset lies
+            outside the string table or the string table itself is
+            unavailable). An empty string means the entry really holds an
+            empty name, so the two cases stay distinguishable.
         """
-        name_offset = section_header['sh_name']
-        return self._section_header_stringtable.get_string(name_offset)
+        try:
+            return self._section_header_stringtable.get_string_lenient(
+                section_header['sh_name'])
+        except ELFParseError:
+            return None
 
     def _make_section(self, section_header: Container) -> Section:
         """ Create a section object of the appropriate type
@@ -787,15 +1147,18 @@ class ELFFile:
 
     @cached_property
     def _section_name_map(self) -> dict[str, int]:
-        return {
-            sec.name: i
-            for i, sec in enumerate(self.iter_sections())
-        }
+        name_map: dict[str, int] = {}
+        for i, sec in enumerate(self.iter_sections()):
+            # A name that cannot be resolved is not registered: it must not
+            # masquerade as a section called '' or a duplicate.
+            if sec.name is not None:
+                name_map[sec.name] = i
+        return name_map
 
     def _make_symbol_table_section(
         self,
         section_header: Container,
-        name: str,
+        name: str | None,
     ) -> SymbolTableSection:
         """ Create a SymbolTableSection
         """
@@ -809,7 +1172,7 @@ class ELFFile:
     def _make_symbol_table_index_section(
         self,
         section_header: Container,
-        name: str,
+        name: str | None,
     ) -> SymbolTableIndexSection:
         """ Create a SymbolTableIndexSection object
         """
@@ -821,7 +1184,7 @@ class ELFFile:
     def _make_sunwsyminfo_table_section(
         self,
         section_header: Container,
-        name: str,
+        name: str | None,
     ) -> SUNWSyminfoTableSection:
         """ Create a SUNWSyminfoTableSection
         """
@@ -832,7 +1195,7 @@ class ELFFile:
             elffile=self,
             symboltable=strtab_section)
 
-    def _make_gnu_verneed_section(self, section_header: Container, name: str) -> GNUVerNeedSection:
+    def _make_gnu_verneed_section(self, section_header: Container, name: str | None) -> GNUVerNeedSection:
         """ Create a GNUVerNeedSection
         """
         linked_strtab_index = section_header['sh_link']
@@ -842,7 +1205,7 @@ class ELFFile:
             elffile=self,
             stringtable=strtab_section)
 
-    def _make_gnu_verdef_section(self, section_header: Container, name: str) -> GNUVerDefSection:
+    def _make_gnu_verdef_section(self, section_header: Container, name: str | None) -> GNUVerDefSection:
         """ Create a GNUVerDefSection
         """
         linked_strtab_index = section_header['sh_link']
@@ -852,7 +1215,7 @@ class ELFFile:
             elffile=self,
             stringtable=strtab_section)
 
-    def _make_gnu_versym_section(self, section_header: Container, name: str) -> GNUVerSymSection:
+    def _make_gnu_versym_section(self, section_header: Container, name: str | None) -> GNUVerSymSection:
         """ Create a GNUVerSymSection
         """
         linked_symtab_index = section_header['sh_link']
@@ -862,14 +1225,14 @@ class ELFFile:
             elffile=self,
             symboltable=symtab_section)
 
-    def _make_elf_hash_section(self, section_header: Container, name: str) -> ELFHashSection:
+    def _make_elf_hash_section(self, section_header: Container, name: str | None) -> ELFHashSection:
         linked_symtab_index = section_header['sh_link']
         symtab_section = self._get_linked_symtab_section(linked_symtab_index)
         return ELFHashSection(
             section_header, name, self, symtab_section
         )
 
-    def _make_gnu_hash_section(self, section_header: Container, name: str) -> GNUHashSection:
+    def _make_gnu_hash_section(self, section_header: Container, name: str | None) -> GNUHashSection:
         linked_symtab_index = section_header['sh_link']
         symtab_section = self._get_linked_symtab_section(linked_symtab_index)
         return GNUHashSection(
@@ -878,11 +1241,20 @@ class ELFFile:
 
     def _get_segment_header(self, n: int) -> Container:  # Elf_Phdr:
         """ Find the header of segment #n, parse it and return the struct
+
+            Judged with the same rules as :meth:`_get_section_header`.
         """
+        declared, available = self.segment_table_capacity()
+        self._check_table_prefix(n, declared, available, 'program header table')
+
+        stream_pos = self._segment_offset(n)
+        entry_size = self.structs.Elf_Phdr.sizeof()
+        self._check_entry_bytes(
+            stream_pos, entry_size, n, 'program header table')
         return struct_parse(
             self.structs.Elf_Phdr,
             self.stream,
-            stream_pos=self._segment_offset(n))
+            stream_pos=stream_pos)
 
     @cached_property
     def _section_header_stringtable(self) -> StringTableSection:
@@ -904,8 +1276,21 @@ class ELFFile:
     def _parse_elf_header(self) -> Container:
         """ Parses the ELF file header and assigns the result to attributes
             of this object.
+
+            A header truncated in the middle is a whole-file rejection: no
+            structure in the file can be trusted without it.
         """
-        return struct_parse(self.structs.Elf_Ehdr, self.stream, stream_pos=0)
+        header_size = self.structs.Elf_Ehdr.sizeof()
+        try:
+            return struct_parse(self.structs.Elf_Ehdr, self.stream, stream_pos=0)
+        except ELFParseError as e:
+            raise ELFUnparsableFileError(
+                f'ELF header is truncated: expected {header_size} bytes, '
+                f'found {min(self.stream_len, header_size)}',
+                structure='ELF header',
+                expected=header_size,
+                actual=min(self.stream_len, header_size),
+            ) from e
 
     def _read_dwarf_section(
         self,
@@ -945,33 +1330,71 @@ class ELFFile:
     @staticmethod
     def _decompress_dwarf_section(section: DebugSectionDescriptor) -> DebugSectionDescriptor:
         """ Returns the uncompressed contents of the provided DWARF section.
+
+            A malformed legacy ``.zdebug_*`` section is rejected with
+            :class:`ELFCompressionError`, never with a bare ``assert`` or a
+            raw ``zlib`` error.
         """
         # TODO: support other compression formats from readelf.c
-        assert section.size > 12, 'Unsupported compression format.'
+        if section.size <= 12:
+            raise ELFCompressionError(
+                'compressed DWARF section is too small for its header',
+                structure='compressed section',
+                expected=13,
+                actual=section.size,
+            )
 
         section.stream.seek(0)
         # According to readelf.c the content should contain "ZLIB"
         # followed by the uncompressed section size - 8 bytes in
         # big-endian order
         compression_type = section.stream.read(4)
-        assert compression_type == b'ZLIB', \
-            f'Invalid compression type: {compression_type!r}'
+        if compression_type != b'ZLIB':
+            raise ELFCompressionError(
+                'compressed DWARF section does not start with a ZLIB marker',
+                structure='compressed section',
+            )
 
-        uncompressed_size = struct.unpack('>Q', section.stream.read(8))[0]
+        header = section.stream.read(8)
+        if len(header) != 8:
+            raise ELFCompressionError(
+                'compressed DWARF section header is truncated',
+                structure='compressed section',
+                expected=8,
+                actual=len(header),
+            )
+        uncompressed_size = struct.unpack('>Q', header)[0]
 
         decompressor = zlib.decompressobj()
         uncompressed_stream = BytesIO()
-        while True:
-            chunk = section.stream.read(4096)
-            if not chunk:
-                break
-            uncompressed_stream.write(decompressor.decompress(chunk))
-        uncompressed_stream.write(decompressor.flush())
+        try:
+            while True:
+                chunk = section.stream.read(4096)
+                if not chunk:
+                    break
+                uncompressed_stream.write(decompressor.decompress(chunk))
+                if uncompressed_stream.tell() > Section.MAX_MATERIALIZED_SIZE:
+                    raise ELFCompressionError(
+                        'decompressed DWARF section exceeds the materialization '
+                        'limit',
+                        structure='compressed section',
+                    )
+            uncompressed_stream.write(decompressor.flush())
+        except zlib.error as e:
+            raise ELFCompressionError(
+                'compressed DWARF section stream is corrupt',
+                structure='compressed section',
+            ) from e
 
         uncompressed_stream.seek(0, io.SEEK_END)
         size = uncompressed_stream.tell()
-        assert uncompressed_size == size, \
-                f'Wrong uncompressed size: expected {uncompressed_size!r}, but got {size!r}'
+        if uncompressed_size != size:
+            raise ELFCompressionError(
+                f'Wrong uncompressed size: expected {uncompressed_size!r}, but got {size!r}',
+                structure='compressed section',
+                expected=uncompressed_size,
+                actual=size,
+            )
 
         return section._replace(stream=uncompressed_stream, size=size)
 

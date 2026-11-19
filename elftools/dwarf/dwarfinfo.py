@@ -50,7 +50,9 @@ if TYPE_CHECKING:
 #
 class DebugSectionDescriptor(NamedTuple):
     stream: IO[bytes]
-    name: str
+    # None means the section name could not be resolved from its string table;
+    # '' would be a real empty name.
+    name: str | None
     global_offset: int | None
     size: int
     address: int

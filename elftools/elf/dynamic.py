@@ -13,7 +13,7 @@ from collections import defaultdict
 from functools import cached_property
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
-from ..common.exceptions import ELFError
+from ..common.exceptions import ELFError, ELFParseError
 from ..common.utils import elf_assert, parse_cstring_from_stream, struct_parse
 from .enums import ENUM_D_TAG
 from .hash import ELFHashTable, GNUHashTable
@@ -276,7 +276,7 @@ class Dynamic:
 class DynamicSection(Section, Dynamic):
     """ ELF dynamic table section.  Knows how to process the list of tags.
     """
-    def __init__(self, header: Container, name: str, elffile: ELFFile) -> None:
+    def __init__(self, header: Container, name: str | None, elffile: ELFFile) -> None:
         Section.__init__(self, header, name, elffile)
         stringtable = elffile.get_section(header['sh_link'], ('SHT_STRTAB', 'SHT_NOBITS', 'SHT_NULL'))
         Dynamic.__init__(self, self.stream, self.elffile, stringtable,
@@ -367,10 +367,26 @@ class DynamicSegment(Segment, Dynamic):
 
     def get_symbol(self, index: int) -> Symbol:
         """ Get the symbol at index #index from the table (Symbol object)
+
+            Unlike a section-backed symbol table, a dynamic segment has no
+            declared entry count of its own, so the index is bounded by the
+            symbol count recovered from the hash table / DT_SYMTAB extent.
         """
         tab_ptr, tab_offset = self.get_table_offset('DT_SYMTAB')
         if tab_ptr is None or tab_offset is None:
             raise ELFError('Segment does not contain DT_SYMTAB.')
+
+        num_symbols = self.num_symbols()
+        if index < 0 or index >= num_symbols:
+            raise ELFParseError(
+                f'symbol index {index} is outside the {num_symbols} symbols in '
+                'the dynamic symbol table',
+                structure='symbol table',
+                index=index,
+                first_invalid_index=num_symbols,
+                declared_count=num_symbols,
+                available_count=num_symbols,
+            )
 
         symbol = struct_parse(
             self.elfstructs.Elf_Sym,
@@ -391,9 +407,10 @@ class DynamicSegment(Segment, Dynamic):
 
     @cached_property
     def _symbol_name_map(self) -> dict[str, list[int]]:
-        smap = defaultdict(list)
+        smap: dict[str, list[int]] = defaultdict(list)
         for i, sym in enumerate(self.iter_symbols()):
-            smap[sym.name].append(i)
+            if sym.name is not None:
+                smap[sym.name].append(i)
         return smap
 
     def iter_symbols(self) -> Iterator[Symbol]:

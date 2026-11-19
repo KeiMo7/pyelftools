@@ -135,8 +135,20 @@ def _get_cu_base(cu: CompileUnit):
 # formatting symbol names for display.
 _CONTROL_CHAR_RE = re.compile(r'[\x01-\x1f]')
 
-def _format_symbol_name(s: str) -> str:
+def _format_symbol_name(s: str | None) -> str:
+    # None means the name could not be resolved from its string table; it is
+    # not the same as a real empty name.
+    if s is None:
+        return '<corrupt name>'
     return _CONTROL_CHAR_RE.sub(lambda match: '^' + chr(0x40 + ord(match[0])), s)
+
+def _format_section_name(s: str | None) -> str:
+    if s is None:
+        return '<corrupt name>'
+    return s
+
+def _format_version_name(s: str | None) -> str:
+    return '<corrupt name>' if s is None else s
 
 class ReadElf:
     """ display_* methods are used to emit output into the output stream
@@ -378,7 +390,7 @@ class ReadElf:
                              section['sh_type'] == 'SHT_NOBITS' and
                              segment['p_type'] != 'PT_TLS') and
                         segment.section_in_segment(section)):
-                    self._emit(f'{section.name} ')
+                    self._emit(f'{_format_section_name(section.name)} ')
 
             self._emitline('')
 
@@ -409,7 +421,7 @@ class ReadElf:
         #
         for nsec, section in enumerate(self.elffile.iter_sections()):
             self._emit(
-                f"  [{nsec:2d}] {section.name:<17.17} "
+                f"  [{nsec:2d}] {_format_section_name(section.name):<17.17} "
                 f"{describe_sh_type(section['sh_type']):<15.15} "
             )
 
@@ -466,12 +478,14 @@ class ReadElf:
                 continue
 
             if section['sh_entsize'] == 0:
-                self._emitline(f"\nSymbol table '{section.name}' has a sh_entsize of zero!")
+                self._emitline(
+                    "\nSymbol table "
+                    f"'{_format_section_name(section.name)}' has a sh_entsize of zero!")
                 continue
 
             symbol_count = section.num_symbols()
             self._emitline(
-                f"\nSymbol table '{section.name}' contains {symbol_count:d} "
+                f"\nSymbol table '{_format_section_name(section.name)}' contains {symbol_count:d} "
                 f"{'entry' if symbol_count == 1 else 'entries'}:"
             )
 
@@ -500,13 +514,14 @@ class ReadElf:
                             else:
                                 version_info = '@@{name}'.format(**version)
 
-                symbol_name = symbol.name
+                symbol_name = _format_symbol_name(symbol.name)
                 # Print section names for STT_SECTION symbols as readelf does
                 if (symbol['st_info']['type'] == 'STT_SECTION'
                     and symbol['st_shndx'] != 'SHN_UNDEF'
                     and symbol['st_shndx'] < self.elffile.num_sections()
                     and symbol['st_name'] == 0):
-                    symbol_name = self.elffile.get_section(symbol['st_shndx']).name
+                    symbol_name = _format_section_name(
+                        self.elffile.get_section(symbol['st_shndx']).name)
 
                 # symbol names are truncated to 25 chars, similarly to readelf
                 symbol_size = (
@@ -620,7 +635,7 @@ class ReadElf:
         for section in self.elffile.iter_sections():
             if isinstance(section, NoteSection):
                 for note in section.iter_notes():
-                      self._emitline(f"\nDisplaying notes found in: {section.name}")
+                      self._emitline(f"\nDisplaying notes found in: {_format_section_name(section.name)}")
                       self._emitline('  Owner                Data size        Description')
                       self._emitline('  {} {}\t{}'.format(
                           note['n_name'].ljust(20),
@@ -638,7 +653,7 @@ class ReadElf:
             has_relocation_sections = True
             relocation_count = section.num_relocations()
             self._emitline(
-                f"\nRelocation section '{section.name:.128}' at offset "
+                f"\nRelocation section '{_format_section_name(section.name):.128}' at offset "
                 f"{self._format_hex(section['sh_offset'])} contains "
                 f"{relocation_count:d} "
                 f"{'entry' if relocation_count == 1 else 'entries'}:"
@@ -678,10 +693,10 @@ class ReadElf:
                                                            rel['r_info_sym'],
                                                            section['sh_link'])
                         symsec = self.elffile.get_section(symsecidx)
-                        symbol_name = symsec.name
+                        symbol_name = _format_section_name(symsec.name)
                         version = ''
                     else:
-                        symbol_name = symbol.name
+                        symbol_name = _format_symbol_name(symbol.name)
                         version = (versym.get_symbol_version(rel['r_info_sym'])
                                    if versym is not None else None)
                         version = (version['name']
@@ -795,7 +810,7 @@ class ReadElf:
                 for verdef, verdaux_iter in section.iter_versions():
                     verdaux = next(verdaux_iter)
 
-                    name = verdaux.name
+                    name = _format_version_name(verdaux.name)
                     if verdef['vd_flags']:
                         flags = describe_ver_flags(verdef['vd_flags'])
                         # Mimic exactly the readelf output
@@ -815,7 +830,7 @@ class ReadElf:
                     for idx, verdaux in enumerate(verdaux_iter, start=1):
                         self._emitline(
                             f"  {self._format_hex(verdaux_offset, fieldsize=4)}: "
-                            f"Parent {idx:d}: {verdaux.name}"
+                            f"Parent {idx:d}: {_format_version_name(verdaux.name)}"
                         )
                         verdaux_offset += verdaux['vda_next']
 
@@ -829,7 +844,8 @@ class ReadElf:
 
                     self._emitline(
                         f"  {self._format_hex(offset, fieldsize=6, alternate=True)}: "
-                        f"Version: {verneed['vn_version']:d}  File: {verneed.name}  "
+                        f"Version: {verneed['vn_version']:d}  "
+                        f"File: {_format_version_name(verneed.name)}  "
                         f"Cnt: {verneed['vn_cnt']:d}"
                     )
 
@@ -844,7 +860,7 @@ class ReadElf:
 
                         self._emitline(
                             f"  {self._format_hex(vernaux_offset, fieldsize=4)}:   "
-                            f"Name: {vernaux.name}  Flags: {flags}  "
+                            f"Name: {_format_version_name(vernaux.name)}  Flags: {flags}  "
                             f"Version: {vernaux['vna_other']:d}"
                         )
 
@@ -874,7 +890,7 @@ class ReadElf:
             self._emitline(f"Section '{section_spec}' has no data to dump.")
             return
 
-        self._emitline(f"\nHex dump of section '{section.name}':")
+        self._emitline(f"\nHex dump of section '{_format_section_name(section.name)}':")
         self._note_relocs_for_section(section)
         addr = section['sh_addr']
         dataptr = 0
@@ -920,7 +936,7 @@ class ReadElf:
             self._emitline(f"\nSection '{section_spec}' has no data to dump.")
             return
 
-        self._emitline(f"\nString dump of section '{section.name}':")
+        self._emitline(f"\nString dump of section '{_format_section_name(section.name)}':")
 
         found = False
         data = section.data()
@@ -1040,7 +1056,7 @@ class ReadElf:
             num_entries = version_section.num_symbols()
 
         self._emitline(
-            f"\n{name} section '{version_section.name}' contains {num_entries:d} "
+            f"\n{name} section '{_format_section_name(version_section.name)}' contains {num_entries:d} "
             f"{'entry' if num_entries == 1 else 'entries'}:"
         )
         link = version_section['sh_link']
@@ -1332,7 +1348,7 @@ class ReadElf:
             while `cfi_entries` must be an iterable that yields the sequence of
             CIE or FDE instances.
         """
-        self._emitline(f'Contents of the {section.name} section:')
+        self._emitline(f'Contents of the {_format_section_name(section.name)} section:')
 
         for entry in cfi_entries:
             if isinstance(entry, CIE):
@@ -1404,7 +1420,7 @@ class ReadElf:
         if not namelut:
             return
 
-        self._emitline(f'Contents of the {section.name} section:')
+        self._emitline(f'Contents of the {_format_section_name(section.name)} section:')
         self._emitline()
 
         cu_headers = namelut.get_cu_headers()
@@ -1466,7 +1482,7 @@ class ReadElf:
         while `cfi_entries` must be an iterable that yields the sequence of
         CIE or FDE instances.
         """
-        self._emitline(f'Contents of the {section.name} section:')
+        self._emitline(f'Contents of the {_format_section_name(section.name)} section:')
 
         for entry in cfi_entries:
             if isinstance(entry, CIE):

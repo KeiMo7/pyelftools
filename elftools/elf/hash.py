@@ -11,6 +11,7 @@ from __future__ import annotations
 import struct
 from typing import TYPE_CHECKING, Protocol
 
+from ..common.exceptions import ELFParseError
 from ..common.utils import preserve_stream_pos, struct_parse
 from ..construct.lib.container import Container
 from .sections import Section
@@ -76,11 +77,17 @@ class ELFHashTable:
             return None
         hval = self.elf_hash(name) % self.params['nbuckets']
         symndx = self.params['buckets'][hval]
+        # Corrupt chains may point outside the buckets/chains arrays; such a
+        # link means the name is not resolvable, not that the adjacent bytes
+        # should be parsed as a symbol index.
+        chains = self.params['chains']
         while symndx != 0:
+            if symndx < 0 or symndx >= len(chains):
+                return None
             sym = self._symboltable.get_symbol(symndx)
             if sym and sym.name == name:
                 return sym
-            symndx = self.params['chains'][symndx]
+            symndx = chains[symndx]
         return None
 
     @staticmethod
@@ -108,7 +115,7 @@ class ELFHashSection(Section, ELFHashTable):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         symboltable: _SymbolTable,
     ) -> None:
@@ -164,7 +171,15 @@ class GNUHashTable:
 
         # Walk the chain to its end (lowest bit is set)
         while True:
-            cur_hash = struct.unpack(hash_format, self.elffile.stream.read(self._wordsize))[0]
+            data = self.elffile.stream.read(self._wordsize)
+            if len(data) != self._wordsize:
+                raise ELFParseError(
+                    'GNU hash table chain runs past the end of the file',
+                    structure='GNU hash table',
+                    expected=self._wordsize,
+                    actual=len(data),
+                )
+            cur_hash = struct.unpack(hash_format, data)[0]
             if cur_hash & 1:
                 return max_idx + 1
 
@@ -226,7 +241,7 @@ class GNUHashSection(Section, GNUHashTable):
     def __init__(
         self,
         header: Container,
-        name: str,
+        name: str | None,
         elffile: ELFFile,
         symboltable: _SymbolTable,
     ) -> None:

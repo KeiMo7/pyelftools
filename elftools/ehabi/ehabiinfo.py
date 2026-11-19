@@ -37,7 +37,7 @@ class EHABIInfo:
         self._arm_idx_section = arm_idx_section
         self._struct = EHABIStructs(little_endian)
 
-    def section_name(self) -> str:
+    def section_name(self) -> str | None:
         return self._arm_idx_section.name
 
     def section_offset(self) -> int:

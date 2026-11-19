@@ -135,6 +135,60 @@ count and enumerate them. There are also some special segment classes
 that have more information about well-known segments. Take a look at
 `elftools/elf/segments.py` for more details.
 
+### Malformed and truncated input
+
+When an ELF file is untrusted data, every value returned by the parser must
+either be trustworthy or be reported as unavailable. **pyelftools** never
+returns a value assembled from bytes outside the structure it belongs to, and
+never lets a lower-level exception (from byte parsing, seeking, decompression
+or the `construct` library) escape.
+
+All rejections derive from `ELFError` (in `elftools/common/exceptions.py`), so
+a caller can handle them with a single `except ELFError`. They fall into two
+kinds that are distinguishable through their type and `scope` attribute:
+
+* `ELFUnparsableFileError` (`scope == 'file'`) means the file as a whole is
+  unusable, for example because the ELF header or its identification bytes are
+  truncated.
+* `ELFParseError` (`scope == 'structure'`) means one structure is unusable
+  while the rest of the file may still be readable. Every such error carries
+  machine-readable location fields: `structure`, `index`, `expected`,
+  `actual`, and - for a table-level rejection - `first_invalid_index`,
+  `declared_count` and `available_count`. The message contains indices and
+  byte counts only, never bytes from the file. `ELFCompressionError` is a
+  subclass of `ELFParseError` covering truncated compression headers, size
+  mismatches and corrupt streams.
+
+Bounds are checked from header fields before any bytes are read or any buffer
+is allocated, so a malformed sample cannot amplify memory use or reads.
+
+The strict entry points (`get_section`, `get_segment`, `iter_sections`,
+`iter_segments`, `get_symbol`, `get_string`, `data`) raise on a malformed
+entry. To keep the successfully parsed part of a malformed file, use the
+lenient variants, which return a `TableScan` (in `elftools/elf/report.py`):
+
+```python
+scan = elf.iter_sections_lenient()
+for section in scan:          # only usable entries are yielded
+    ...
+for rejection in scan.rejections:
+    print(rejection.structure, rejection.index, rejection.reason)
+if scan.truncated_at is not None:
+    print('table truncated at entry', scan.truncated_at)
+```
+
+`classify_section(n)` and `classify_segment(n)` are the single-item
+counterparts and return `(entry, None)` or `(None, rejection)`, judging an
+entry exactly like the table scan does. A name that cannot be resolved is
+reported as `None` (for example `Section.name`, `Symbol.name`,
+`Version.name`), which is distinct from a real empty name (`''`).
+
+A size that is declared in a header but not backed by file data (a NOBITS
+section, or the declared output of a compressed section) is materialized only
+up to `Section.MAX_MATERIALIZED_SIZE` bytes (1 GiB by default); a larger
+declaration is rejected with `ELFParseError` before allocation. Raise that
+class attribute if your workload legitimately needs larger buffers.
+
 ### Structs and headers
 
 Most objects in ELF and DWARF have \"headers\", and such objects usually

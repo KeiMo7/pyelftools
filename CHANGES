@@ -1,6 +1,33 @@
 Changelog
 =========
 
++ Unreleased
+
+  - Unified rejection semantics for malformed and truncated ELF input:
+    - All rejections derive from `ELFError`. `ELFUnparsableFileError` marks a
+      wholly unparsable file (e.g. a truncated ELF header); `ELFParseError`
+      marks one unusable structure. `ELFCompressionError` is now a subclass of
+      `ELFParseError`.
+    - `ELFParseError` carries `structure`, `index`, `expected`, `actual` and,
+      for table-level rejections, `first_invalid_index` / `declared_count` /
+      `available_count`; messages never echo file bytes.
+    - Section and program header tables are validated against the file
+      capacity before any entry is read. Entries beyond the capacity are
+      rejected from the first unavailable index while the usable prefix stays
+      enumerable.
+    - Added `iter_sections_lenient` / `iter_segments_lenient` returning a
+      `TableScan` of the usable prefix plus per-entry rejections, and
+      `classify_section` / `classify_segment` as single-item counterparts.
+    - Out-of-range symbol indices and string offsets are rejected instead of
+      reading adjacent bytes. An unresolvable name is reported as `None`,
+      distinct from a real empty name.
+    - Compressed sections converge on `ELFCompressionError` for a truncated
+      header, a declared size mismatch and a corrupt stream; declared sizes
+      that are not file-backed are bounded before allocation.
+    - Added `test/test_malformed_structures.py` covering truncation, capacity,
+      index and name rejections, before-read checks and byte-for-byte
+      prefix truncation of a legal sample.
+
 + Starting with version 0.31, please use the GitHub UI
   at https://github.com/eliben/pyelftools/tags
   to compare tags in order to find out what changed.

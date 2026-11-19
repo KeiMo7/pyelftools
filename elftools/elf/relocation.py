@@ -119,7 +119,7 @@ class RelocationTable:
 class RelocationSection(Section, RelocationTable):
     """ ELF relocation section. Serves as a collection of Relocation entries.
     """
-    def __init__(self, header: Container, name: str, elffile: ELFFile) -> None:
+    def __init__(self, header: Container, name: str | None, elffile: ELFFile) -> None:
         Section.__init__(self, header, name, elffile)
         RelocationTable.__init__(self, self.elffile,
             self['sh_offset'], self['sh_size'], header['sh_type'] == 'SHT_RELA')
@@ -219,7 +219,7 @@ class RelrRelocationTable:
 class RelrRelocationSection(Section, RelrRelocationTable):
     """ ELF RELR relocation section. Serves as a collection of RELR relocation entries.
     """
-    def __init__(self, header: Container, name: str, elffile: ELFFile) -> None:
+    def __init__(self, header: Container, name: str | None, elffile: ELFFile) -> None:
         Section.__init__(self, header, name, elffile)
         RelrRelocationTable.__init__(self, self.elffile,
             self['sh_offset'], self['sh_size'], self['sh_entsize'])
