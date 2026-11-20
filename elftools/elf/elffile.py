@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import io
 import os
-import struct
-import zlib
 from functools import cached_property
 from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any
 
+from ..common.compression import (
+    DEFAULT_MAX_DECOMPRESSED_SIZE,
+    decompress_zlib_gnu_section,
+)
 from ..common.exceptions import ELFError, ELFParseError
 from ..common.utils import elf_assert, struct_parse
 from ..dwarf.dwarf_util import _file_crc32
@@ -107,6 +109,11 @@ class ELFFile:
         self.e_ident_raw = self.stream.read(16)
 
         self.stream_loader = stream_loader
+
+        # Upper bound on the bytes any single compressed section of this file
+        # may decompress to.  Configurable per file (assign a new value) or
+        # per section (Section.max_decompressed_size override).
+        self.decompression_limit: int = DEFAULT_MAX_DECOMPRESSED_SIZE
 
     @classmethod
     def load_from_path(cls, path: str | bytes) -> ELFFile:
@@ -945,35 +952,17 @@ class ELFFile:
     @staticmethod
     def _decompress_dwarf_section(section: DebugSectionDescriptor) -> DebugSectionDescriptor:
         """ Returns the uncompressed contents of the provided DWARF section.
+
+        GNU-style sections store "ZLIB" followed by the uncompressed section
+        size as a big-endian 64-bit integer.  Reuses the bounded, categorised
+        decompression used for SHF_COMPRESSED sections; failures raise
+        ELFCompressionError with a ``category`` attribute.
         """
-        # TODO: support other compression formats from readelf.c
-        assert section.size > 12, 'Unsupported compression format.'
-
-        section.stream.seek(0)
-        # According to readelf.c the content should contain "ZLIB"
-        # followed by the uncompressed section size - 8 bytes in
-        # big-endian order
-        compression_type = section.stream.read(4)
-        assert compression_type == b'ZLIB', \
-            f'Invalid compression type: {compression_type!r}'
-
-        uncompressed_size = struct.unpack('>Q', section.stream.read(8))[0]
-
-        decompressor = zlib.decompressobj()
-        uncompressed_stream = BytesIO()
-        while True:
-            chunk = section.stream.read(4096)
-            if not chunk:
-                break
-            uncompressed_stream.write(decompressor.decompress(chunk))
-        uncompressed_stream.write(decompressor.flush())
-
-        uncompressed_stream.seek(0, io.SEEK_END)
-        size = uncompressed_stream.tell()
-        assert uncompressed_size == size, \
-                f'Wrong uncompressed size: expected {uncompressed_size!r}, but got {size!r}'
-
-        return section._replace(stream=uncompressed_stream, size=size)
+        # The descriptor stream holds exactly the section bytes.
+        data = decompress_zlib_gnu_section(
+            section.stream, 0, section.size,
+            section_label=f'section {section.name!r}')
+        return section._replace(stream=BytesIO(data), size=len(data))
 
     def close(self) -> None:
         self.stream.close()

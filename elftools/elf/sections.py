@@ -8,14 +8,20 @@
 #-------------------------------------------------------------------------------
 from __future__ import annotations
 
-import zlib
 from collections import defaultdict
 from functools import cached_property
 from typing import IO, TYPE_CHECKING, Any, Literal, cast, overload
 
 from elftools.construct.lib.container import Container
 
-from ..common.exceptions import ELFCompressionError, ELFParseError
+from ..common.compression import (
+    DEFAULT_MAX_DECOMPRESSED_SIZE,
+    CompressionFailure,
+    compression_error,
+    decompress_zlib_section,
+    unsupported_algorithm_error,
+)
+from ..common.exceptions import ELFParseError
 from ..common.utils import (
     check_file_range,
     elf_assert,
@@ -48,13 +54,22 @@ class Section:
         self.stream: IO[bytes] = self.elffile.stream
         self.structs: ELFStructs = self.elffile.structs
         self._compressed: int = header['sh_flags'] & SH_FLAGS.SHF_COMPRESSED
+        # Upper bound for decompression; None means "inherit from the ELFFile".
+        self._max_decompressed_size: int | None = None
 
         if self.compressed:
             # Read the compression header now to know about the size/alignment
             # of the decompressed data.
             check_file_range(self['sh_offset'], self['sh_size'], self.elffile.stream_len)
             if self['sh_size'] < self.structs.Elf_Chdr.sizeof():
-                raise ELFCompressionError('Compressed section is too small for its header')
+                raise compression_error(
+                    CompressionFailure.INCOMPLETE_STREAM,
+                    f'Compressed {self._section_label()} is too small for its '
+                    f'{self.structs.Elf_Chdr.sizeof()}-byte header '
+                    f'(size {self["sh_size"]})',
+                    section=self._section_label(),
+                    compressed_size=self['sh_size'],
+                    decompressed_size=0)
             header = struct_parse(self.structs.Elf_Chdr,
                                   self.stream,
                                   stream_pos=self['sh_offset'])
@@ -89,11 +104,36 @@ class Section:
         """
         return self._decompressed_align
 
+    @property
+    def max_decompressed_size(self) -> int:
+        """ Upper bound on the bytes this section may decompress to.
+
+        Defaults to the owning ELFFile's decompression_limit (itself 256 MiB
+        unless changed).  Assign a new value to override it for this section
+        only.
+        """
+        if self._max_decompressed_size is not None:
+            return self._max_decompressed_size
+        return getattr(self.elffile, 'decompression_limit',
+                       DEFAULT_MAX_DECOMPRESSED_SIZE)
+
+    @max_decompressed_size.setter
+    def max_decompressed_size(self, value: int) -> None:
+        self._max_decompressed_size = value
+
+    def _section_label(self) -> str:
+        """ Human-readable location of this section, used in error messages.
+        """
+        name = self.name or '<unnamed>'
+        return f'section {name!r} at offset {self["sh_offset"]:#x}'
+
     def data(self) -> bytes:
         """ The section data from the file.
 
         Note that data is decompressed if the stored section data is
-        compressed.
+        compressed.  Decompression either returns exactly data_size bytes or
+        raises ELFCompressionError with a machine-readable ``category``; a
+        truncated result is never returned.
         """
         # If this section is NOBITS, there is no data. provide a dummy answer
         if self.header['sh_type'] == 'SHT_NOBITS':
@@ -109,33 +149,19 @@ class Section:
         # If this section is compressed, deflate it
         if self.compressed:
             c_type = self._compression_type
-            if c_type == 'ELFCOMPRESS_ZLIB':
-                # Read the data to decompress starting right after the
-                # compression header until the end of the section.
-                hdr_size: int = self.structs.Elf_Chdr.sizeof()
-                compressed = stream_read(
-                    self.stream, self['sh_offset'] + hdr_size, self['sh_size'] - hdr_size)
-
-                decomp = zlib.decompressobj()
-                result = decomp.decompress(compressed, self.data_size)
-            elif isinstance(c_type, int):
-                raise ELFCompressionError(
-                    f'Unknown compression type: {c_type:#0x}'
-                )
-            else:
-                raise ELFCompressionError(
-                    f'Unknown compression type: {c_type!r}'
-                )
-
-            if len(result) != self._decompressed_size:
-                raise ELFCompressionError(
-                    f'Decompressed data is {len(result)} bytes long, should be {self._decompressed_size} bytes'
-                    ' long'
-                )
-        else:
-            result = stream_read(self.stream, self['sh_offset'], self._decompressed_size)
-
-        return result
+            if c_type != 'ELFCOMPRESS_ZLIB':
+                raise unsupported_algorithm_error(c_type, self._section_label())
+            # Read the data to decompress starting right after the compression
+            # header until the end of the section.
+            hdr_size: int = self.structs.Elf_Chdr.sizeof()
+            return decompress_zlib_section(
+                self.stream,
+                self['sh_offset'] + hdr_size,
+                self['sh_size'] - hdr_size,
+                self.data_size,
+                section_label=self._section_label(),
+                max_output_size=self.max_decompressed_size)
+        return stream_read(self.stream, self['sh_offset'], self._decompressed_size)
 
     def is_null(self) -> bool:
         """ Is this a null section?

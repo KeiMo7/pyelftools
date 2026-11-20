@@ -47,8 +47,14 @@ class TestCompressedSupport(unittest.TestCase):
                 section.data()
             except ELFCompressionError as exc:
                 self.assertEqual(
-                    str(exc), 'Unknown compression type: 0x7ffffffe'
+                    str(exc),
+                    "Unknown compression type: 0x7ffffffe in section"
+                    " '.debug_info' at offset 0x70"
                 )
+                # The identifier and location are machine-readable too.
+                self.assertEqual(exc.algorithm, 0x7ffffffe)
+                self.assertIn('.debug_info', exc.section)
+                self.assertEqual(exc.category, 'unsupported-algorithm')
             else:
                 self.fail('An exception was exected')
 

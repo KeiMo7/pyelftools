@@ -126,6 +126,27 @@ interacting with the symbol table. There are other special sections
 the same file) and `RelocationSection` (in
 `elftools/elf/relocation.py`).
 
+#### Compressed sections
+
+Sections carrying the `SHF_COMPRESSED` flag (and the GNU-style `.zdebug_*`
+sections) are decompressed transparently by `Section.data()` and
+`ELFFile.get_dwarf_info()`. Decompression is all-or-nothing: it either
+returns exactly `data_size` bytes or raises `ELFCompressionError`. The
+exception carries a machine-readable `category` attribute (a member of
+`elftools.common.compression.CompressionFailure`) that distinguishes, among
+others, data longer than declared, data shorter than declared, trailing data
+after the stream, an unsupported algorithm, a corrupt stream, and a
+compression-bomb output limit being hit. The exception also carries the
+relevant numbers (`declared_size`, `decompressed_size`, `missing_bytes`,
+`trailing_bytes`, `max_output_size`, `section`).
+
+Decompression never allocates from the declared length: input is read in
+16 KiB chunks and each zlib call may emit at most 64 KiB. The total output
+per section is capped at 256 MiB by default; configure it with
+`ELFFile.decompression_limit` or per section with
+`Section.max_decompressed_size`. A failure in one section never affects the
+readability of other sections.
+
 ### ELF segments
 
 Similarly to sections, an ELF segment has a class in **pyelftools** to

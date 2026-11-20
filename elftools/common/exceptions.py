@@ -16,7 +16,14 @@ class ELFParseError(ELFError):
     pass
 
 class ELFCompressionError(ELFError):
-    pass
+    """Raised when a compressed section cannot be decompressed exactly.
+
+    Instances carry a ``category`` attribute (a member of
+    :class:`elftools.common.compression.CompressionFailure`) plus numeric
+    details such as ``declared_size``, ``decompressed_size``,
+    ``max_output_size`` and ``section``.
+    """
+    category: object = None
 
 class DWARFError(Exception):
     pass
