@@ -9,6 +9,7 @@
 #-------------------------------------------------------------------------------
 from __future__ import annotations
 
+import struct
 from typing import TYPE_CHECKING
 
 import elftools.elf .enums as e
@@ -40,12 +41,12 @@ from ..construct import (
     ULInt64,
     Value,
 )
+from ..construct.lib.container import Container
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from ..construct.core import FormatField
-    from ..construct.lib.container import Container
 
 
 class ELFStructs:
@@ -383,6 +384,7 @@ class ELFStructs:
                 self.Elf_addr('st_value'),
                 self.Elf_xword('st_size'),
             )
+        self.Elf_Sym_fast = SymbolDecoder(self)
 
     def _create_sunw_syminfo(self) -> None:
         self.Elf_Sunw_Syminfo = Struct('Elf_Sunw_Syminfo',
@@ -621,3 +623,84 @@ class ELFStructs:
             CString("filename"),
             Padding(lambda ctx: 3 - len(ctx.filename) % 4, strict=True),
             self.Elf_word("checksum"))
+
+
+class SymbolDecoder:
+    """ Fast decoder for Elf_Sym entries.
+
+        The construct tree is convenient but costs several function calls per
+        field. A table can hold millions of entries, so entry parsing uses
+        this decoder: it unpacks the fixed layout once and looks the enum
+        names up in prebuilt tables.
+
+        The decoder is built from the same enum mappings the construct uses,
+        and :meth:`decode` checks the structure's shape before relying on it.
+        If anything unexpected is found it returns None and the caller falls
+        back to the construct parser, so output can never diverge silently.
+    """
+
+    def __init__(self, structs: ELFStructs) -> None:
+        self._structs = structs
+        self._layout: tuple[str, ...] | None = self._detect_layout()
+        if self._layout is None:
+            return
+        endian = '<' if structs.little_endian else '>'
+        self._unpack = struct.Struct(endian + (
+            'IIIBBH' if structs.elfclass == 32 else 'IBBHQQ')).unpack_from
+        self._bind = _reverse_enum(e.ENUM_ST_INFO_BIND)
+        self._type = _reverse_enum(e.ENUM_ST_INFO_TYPE)
+        self._local = _reverse_enum(e.ENUM_ST_LOCAL)
+        self._visibility = _reverse_enum(e.ENUM_ST_VISIBILITY)
+        self._shndx = _reverse_enum(e.ENUM_ST_SHNDX)
+        self._info = tuple(
+            Container(bind=self._bind.get(b >> 4, b >> 4),
+                      type=self._type.get(b & 0xf, b & 0xf))
+            for b in range(256))
+        self._other = tuple(
+            Container(local=self._local.get((b >> 5) & 7, (b >> 5) & 7),
+                      visibility=self._visibility.get(b & 7, b & 7))
+            for b in range(256))
+
+    def _detect_layout(self) -> tuple[str, ...] | None:
+        try:
+            sym = self._structs.Elf_Sym
+            layout = tuple(sc.name for sc in sym.subcons)
+        except AttributeError:
+            return None
+        if self._structs.elfclass == 32:
+            expected = ('st_name', 'st_value', 'st_size', 'st_info',
+                        'st_other', 'st_shndx')
+        else:
+            expected = ('st_name', 'st_info', 'st_other', 'st_shndx',
+                        'st_value', 'st_size')
+        return layout if layout == expected else None
+
+    def available(self) -> bool:
+        return self._layout is not None
+
+    def decode(self, data: bytes) -> Container | None:
+        """ Decode one entry from its bytes, or None if the layout drifted.
+        """
+        if self._layout is None:
+            return None
+        try:
+            fields = self._unpack(data)
+        except struct.error:
+            return None
+        if self._structs.elfclass == 32:
+            st_name, st_value, st_size, info, other, shndx = fields
+            return Container(st_name=st_name, st_value=st_value,
+                             st_size=st_size, st_info=self._info[info],
+                             st_other=self._other[other],
+                             st_shndx=self._shndx.get(shndx, shndx))
+        st_name, info, other, shndx, st_value, st_size = fields
+        return Container(st_name=st_name, st_info=self._info[info],
+                         st_other=self._other[other],
+                         st_shndx=self._shndx.get(shndx, shndx),
+                         st_value=st_value, st_size=st_size)
+
+
+def _reverse_enum(mapping: Mapping[str, int]) -> dict[int, str]:
+    """ Invert an ENUM_* mapping, dropping its default entry.
+    """
+    return {value: name for name, value in mapping.items() if name != '_default_'}

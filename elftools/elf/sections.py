@@ -8,14 +8,21 @@
 #-------------------------------------------------------------------------------
 from __future__ import annotations
 
+import struct
 import zlib
-from collections import defaultdict
-from functools import cached_property
+from collections import OrderedDict
+from threading import RLock
 from typing import IO, TYPE_CHECKING, Any, Literal, cast, overload
+from weakref import WeakKeyDictionary
 
 from elftools.construct.lib.container import Container
 
-from ..common.exceptions import ELFCompressionError, ELFParseError
+from ..common.exceptions import (
+    ELFCompressionError,
+    ELFMemoryLimitError,
+    ELFParseError,
+    ELFSymbolError,
+)
 from ..common.utils import (
     check_file_range,
     elf_assert,
@@ -23,6 +30,7 @@ from ..common.utils import (
     stream_read,
     struct_parse,
 )
+from ..construct.core import ConstructError
 from .constants import SH_FLAGS
 from .notes import iter_notes
 
@@ -31,6 +39,36 @@ if TYPE_CHECKING:
 
     from .elffile import ELFFile
     from .structs import ELFStructs
+
+
+_stream_locks: WeakKeyDictionary[Any, RLock] = WeakKeyDictionary()
+
+
+def _shared_stream_lock(owner: Any) -> RLock:
+    """ Return a per-file reentrant lock guarding seeks on its stream.
+
+        Symbol access reads and parses under this lock, so readers sharing one
+        file object can interleave without one seeing the other's cursor or a
+        half-read entry. The lock is stored on the owner itself (so lookups
+        are a plain attribute read), and is reentrant because parsing may nest.
+    """
+    lock = getattr(owner, '_elftools_stream_lock', None)
+    if lock is not None:
+        return lock
+    lock = RLock()
+    try:
+        owner._elftools_stream_lock = lock
+    except (AttributeError, TypeError):
+        # The owner does not accept attributes; fall back to a weak map.
+        key = owner if owner is not None else object()
+        try:
+            lock = _stream_locks.get(key)
+            if lock is None:
+                lock = RLock()
+                _stream_locks[key] = lock
+        except TypeError:
+            lock = RLock()
+    return lock
 
 
 class Section:
@@ -172,12 +210,422 @@ class NullSection(Section):
 class StringTableSection(Section):
     """ ELF string table section.
     """
+    # When the table is compressed it has to be inflated before it can be
+    # scanned. Refuse to inflate an unreasonably large table rather than
+    # silently materializing it.
+    max_decompressed_scan_size: int = 256 * 1024 * 1024
+
     def get_string(self, offset: int) -> str:
         """ Get the string stored at the given offset in this string table.
         """
         table_offset = self['sh_offset']
-        s = parse_cstring_from_stream(self.stream, table_offset + offset)
+        with _shared_stream_lock(self.elffile):
+            s = parse_cstring_from_stream(self.stream, table_offset + offset)
         return s.decode('utf-8', errors='replace') if s else ''
+
+    def _iter_scan_chunks(self, chunk_size: int) -> Iterator[bytes]:
+        """ Yield the logical (decompressed, if needed) table bytes in order,
+            in chunks no larger than chunk_size.
+
+            Each chunk is read at an explicit offset under the shared stream
+            lock, so concurrent readers of the same file cannot disturb each
+            other.
+        """
+        size = self.data_size
+        if self.compressed:
+            if size > self.max_decompressed_scan_size:
+                raise ELFMemoryLimitError(
+                    f'string table {self.name!r} would need {size} bytes to '
+                    f'decompress for scanning, limit is '
+                    f'{self.max_decompressed_scan_size}',
+                    category='symbol-names')
+            data = self.data()
+            for off in range(0, len(data), chunk_size):
+                yield data[off:off + chunk_size]
+            return
+
+        table_offset = self['sh_offset']
+        for off in range(0, size, chunk_size):
+            n = min(chunk_size, size - off)
+            with _shared_stream_lock(self.elffile):
+                chunk = stream_read(self.stream, table_offset + off, n)
+            # Yield after releasing the lock so a scan in one thread does not
+            # starve readers in another for its whole duration.
+            yield chunk
+
+
+class _BoundedSymbolAccess:
+    """ Bounded-memory access to a symbol table.
+
+        This mixin implements iteration, random access and name lookup without
+        ever materializing the whole table. The memory held by an instance is
+        bounded by configuration, never by the number of symbols in the file:
+
+          - ``iter_symbols`` streams entries and holds a single entry at a
+            time (plus a bounded read buffer),
+          - ``get_symbol`` keeps recently used entries in an LRU cache whose
+            size is ``max_cached_symbols``,
+          - ``get_symbol_by_name`` scans only the ``st_name`` fields of the
+            table (never parsing entries) and keeps recent query results in an
+            LRU cache whose size is ``max_cached_name_lookups``. Only the
+            entries whose name matches are parsed, and only the strings they
+            reference are read.
+
+        Subclasses provide the table geometry and string-table access through
+        the ``_symbol_*`` hooks. A table whose lookups would need more memory
+        than allowed raises :class:`ELFMemoryLimitError` naming the data
+        category; results are never silently truncated.
+
+        Requested entries and query results are cached in a bounded LRU, so a
+        caller can call :meth:`clear_cache` to drop them as soon as a traversal
+        ends early.
+    """
+
+    #: How many recently used entries are kept parsed in memory.
+    max_cached_symbols: int = 4096
+    #: How many recent name queries keep their index lists in memory.
+    max_cached_name_lookups: int = 1024
+    #: How many matching entries one name query may collect. Exceeding it
+    #: raises ELFMemoryLimitError instead of returning a truncated answer.
+    max_name_candidates: int = 1 << 18
+    #: How many symbol entries are read at once while scanning for a name.
+    #: Together with the string-table chunk size this caps the read buffer.
+    scan_batch_entries: int = 8192
+    #: How many bytes of the string table are read at once while scanning.
+    scan_chunk_bytes: int = 1 << 16
+
+    def _init_symbol_caches(self) -> None:
+        self._symbol_cache_lock = RLock()
+        self._symbol_cache: OrderedDict[int, Symbol] = OrderedDict()
+        self._name_index_cache: OrderedDict[str, tuple[int, ...]] = OrderedDict()
+
+    # -- Hooks provided by the concrete table type --------------------------
+
+    def num_symbols(self) -> int:
+        """ Number of symbols in the table
+        """
+        raise NotImplementedError
+
+    def _symbol_table_bounds(self) -> tuple[int, int]:
+        """ Return the file offset at which the table starts and its size.
+        """
+        raise NotImplementedError
+
+    def _symbol_entry_size(self) -> int:
+        """ The on-disk stride of one symbol entry.
+        """
+        raise NotImplementedError
+
+    def _symbol_struct(self) -> Any:
+        """ The construct that parses one symbol entry.
+        """
+        raise NotImplementedError
+
+    def _symbol_structs(self) -> ELFStructs:
+        """ The ELFStructs of the owning file (for endianness).
+        """
+        raise NotImplementedError
+
+    def _symbol_stream(self) -> IO[bytes]:
+        """ The stream backing the table.
+        """
+        raise NotImplementedError
+
+    def _symbol_stream_owner(self) -> Any:
+        """ Object whose per-file stream lock guards this table.
+        """
+        raise NotImplementedError
+
+    def _symbol_stringtable(self) -> Any:
+        """ The associated string table (get_string and bounded chunk scan).
+        """
+        raise NotImplementedError
+
+    # -- Raw reads ----------------------------------------------------------
+
+    def _read_at(self, offset: int, size: int, index: int) -> bytes:
+        """ Read `size` bytes at `offset` in one locked operation.
+        """
+        stream = self._symbol_stream()
+        with _shared_stream_lock(self._symbol_stream_owner()):
+            try:
+                stream.seek(offset)
+            except (OverflowError, ValueError) as e:
+                raise ELFSymbolError(
+                    f'invalid seek offset {offset}', index) from e
+            data = stream.read(size)
+        if len(data) != size:
+            raise ELFSymbolError(
+                f'entry is truncated: expected {size} bytes at offset '
+                f'{offset}, found {len(data)}', index)
+        return data
+
+    def _symbol_fast_decoder(self) -> Any:
+        """ A fast decoder for the entry struct, or None if unavailable.
+        """
+        return getattr(self._symbol_structs(), 'Elf_Sym_fast', None)
+
+    def _symbol_struct_size(self) -> int:
+        """ sizeof() of the entry struct, computed once per table.
+        """
+        size = getattr(self, '_symbol_struct_size_cache', None)
+        if size is None:
+            size = self._symbol_struct().sizeof()
+            self._symbol_struct_size_cache = size
+        return size
+
+    def _parse_symbol(self, index: int) -> Symbol:
+        """ Parse one entry; failures name the offending index.
+        """
+        struct = self._symbol_struct()
+        full_size = self._symbol_struct_size()
+        entsize = self._symbol_entry_size()
+        size = min(entsize, full_size) if entsize else full_size
+        offset, table_size = self._symbol_table_bounds()
+        entry_offset = offset + index * entsize
+        if offset < 0 or entry_offset < 0 or entry_offset + size > offset + table_size:
+            raise ELFSymbolError(
+                f'entry at index {index} extends past the end of the table',
+                index)
+        data = self._read_at(entry_offset, size, index)
+        decoder = self._symbol_fast_decoder()
+        entry = decoder.decode(data) if decoder is not None else None
+        if entry is None:
+            try:
+                entry = struct.parse(data)
+            except ConstructError as e:
+                raise ELFSymbolError(f'corrupt entry: {e}', index) from e
+        name = self._resolve_name(entry['st_name'], index)
+        return Symbol(entry, name)
+
+    def _resolve_name(self, st_name: int, index: int) -> str:
+        stringtable = self._symbol_stringtable()
+        size = getattr(stringtable, 'data_size', None)
+        if size is not None and st_name >= size:
+            raise ELFSymbolError(
+                f'name offset {st_name} is outside string table '
+                f'{getattr(stringtable, "name", "?")!r} of size {size}', index)
+        try:
+            return stringtable.get_string(st_name)
+        except ELFSymbolError:
+            raise
+        except Exception as e:
+            raise ELFSymbolError(
+                f'cannot read name at string table offset {st_name}: {e}',
+                index) from e
+
+    # -- Caches -------------------------------------------------------------
+
+    def _cache_get(self, cache: OrderedDict[Any, Any], key: Any) -> Any:
+        with self._symbol_cache_lock:
+            value = cache.get(key)
+            if value is not None:
+                cache.move_to_end(key)
+            return value
+
+    def _cache_put(self, cache: OrderedDict[Any, Any], key: Any, value: Any,
+                   limit: int) -> None:
+        if limit <= 0:
+            return
+        with self._symbol_cache_lock:
+            cache[key] = value
+            cache.move_to_end(key)
+            while len(cache) > limit:
+                cache.popitem(last=False)
+
+    def _cached_symbol(self, index: int) -> Symbol:
+        cached = self._cache_get(self._symbol_cache, index)
+        if cached is not None:
+            return cached
+        symbol = self._parse_symbol(index)
+        self._cache_put(self._symbol_cache, index, symbol,
+                        self.max_cached_symbols)
+        return symbol
+
+    def clear_cache(self) -> None:
+        """ Release every cached symbol and name lookup.
+
+            Use this when a traversal is abandoned early so the memory does not
+            carry over into the next analysis. The caches are also released
+            when the owning section is discarded.
+        """
+        with self._symbol_cache_lock:
+            self._symbol_cache.clear()
+            self._name_index_cache.clear()
+
+    def cache_stats(self) -> dict[str, int]:
+        """ Report current cache occupancy together with the limits.
+        """
+        with self._symbol_cache_lock:
+            return {
+                'cached_symbols': len(self._symbol_cache),
+                'max_cached_symbols': self.max_cached_symbols,
+                'cached_name_lookups': len(self._name_index_cache),
+                'max_cached_name_lookups': self.max_cached_name_lookups,
+            }
+
+    # -- Name lookup helpers ------------------------------------------------
+
+    def _matching_string_offsets(self, name: str) -> set[int] | None:
+        """ All string-table offsets that hold exactly `name`.
+
+            The table is scanned in bounded chunks and never read as a whole.
+            Any position is accepted, not just the start of a string, because
+            linkers may merge suffixes and point ``st_name`` into the middle of
+            another name.
+
+            Returns None when an exact answer cannot be derived from the bytes
+            (empty or undecodable names); the caller then resolves names entry
+            by entry, which is still bounded.
+        """
+        try:
+            needle = name.encode('utf-8')
+        except UnicodeEncodeError:
+            return None
+        if not needle or '�' in name:
+            # Undecodable bytes in the table become U+FFFD on decode, and the
+            # empty string is reachable from any NUL byte; neither can be
+            # matched byte-exactly.
+            return None
+
+        strtab = self._symbol_stringtable()
+        strtab_size = getattr(strtab, 'data_size', None)
+        if strtab_size is None:
+            return None
+        chunks = getattr(strtab, '_iter_scan_chunks', None)
+        if chunks is None:
+            return None
+
+        pattern = needle + b'\x00'
+        # Keep the last len(pattern) - 1 bytes so a match spanning a chunk
+        # boundary is still recognized.
+        overlap = len(pattern) - 1
+        found: set[int] = set()
+        tail = b''
+        consumed = 0
+        try:
+            for chunk in chunks(self.scan_chunk_bytes):
+                buf = tail + chunk
+                buf_start = consumed - len(tail)
+                pos = buf.find(pattern)
+                while pos >= 0:
+                    found.add(buf_start + pos)
+                    if len(found) > self.max_name_candidates:
+                        raise ELFMemoryLimitError(
+                            f'name {name!r} occurs at more than '
+                            f'{self.max_name_candidates} string table offsets',
+                            category='symbol-names')
+                    pos = buf.find(pattern, pos + 1)
+                tail = buf[-overlap:] if overlap else b''
+                consumed += len(chunk)
+        except (ELFMemoryLimitError, ELFSymbolError):
+            raise
+        except Exception:  # noqa: BLE001 - fall back to per-entry resolution
+            return None
+        # An offset at or past the end of the table cannot be referenced.
+        return {o for o in found if o < strtab_size}
+
+    def _iter_st_names(self) -> Iterator[tuple[int, int]]:
+        """ Yield (index, st_name) for every entry in bounded batches.
+
+            Only the first four bytes of each entry are unpacked, so scanning
+            the table never builds entry objects.
+        """
+        count = self.num_symbols()
+        entsize = self._symbol_entry_size()
+        if entsize < 4:
+            raise ELFParseError(
+                f'symbol entry size {entsize} is too small to hold st_name')
+        fmt = '<I' if self._symbol_structs().little_endian else '>I'
+        batch = max(1, self.scan_batch_entries)
+        offset, table_size = self._symbol_table_bounds()
+        for first in range(0, count, batch):
+            n = min(batch, count - first)
+            nbytes = n * entsize
+            start = offset + first * entsize
+            if start + nbytes > offset + table_size:
+                # Keep whichever entries are fully inside the table; a
+                # truncated entry is reported when it is reached.
+                n = max(0, (offset + table_size - start) // entsize)
+                nbytes = n * entsize
+            if n == 0:
+                break
+            raw = self._read_at(start, nbytes, first)
+            unpack = struct.unpack_from
+            for k in range(n):
+                yield first + k, unpack(fmt, raw, k * entsize)[0]
+
+    def _indices_by_name(self, name: str) -> tuple[int, ...]:
+        """ Indices of every entry whose name is `name`, in table order.
+        """
+        count = self.num_symbols()
+        offsets = self._matching_string_offsets(name)
+        result: list[int] = []
+        if offsets is not None and not offsets:
+            return ()
+        for i, st_name in self._iter_st_names():
+            if offsets is not None and st_name not in offsets:
+                continue
+            if self._resolve_name(st_name, i) == name:
+                result.append(i)
+                if len(result) > self.max_name_candidates:
+                    raise ELFMemoryLimitError(
+                        f'name {name!r} matches more than '
+                        f'{self.max_name_candidates} symbols',
+                        category='symbol-names')
+            if offsets is None and i + 1 >= count:
+                break
+        return tuple(result)
+
+    # -- Public API ---------------------------------------------------------
+
+    def get_symbol(self, n: int) -> Symbol:
+        """ Get the symbol at index #n from the table (Symbol object).
+
+            Recently requested entries are kept in a bounded LRU cache, so a
+            repeated request does not parse the entry again until it is
+            evicted.
+        """
+        if not 0 <= n < self.num_symbols():
+            raise IndexError(n)
+        return self._cached_symbol(n)
+
+    def get_symbol_by_name(self, name: str) -> list[Symbol] | None:
+        """ Get a symbol(s) by name. Return None if no symbol by the given name
+            exists.
+
+            The table is scanned through its st_name fields; only entries whose
+            name matches are parsed and only the strings those entries
+            reference are read. The resulting index list is kept in a bounded
+            LRU cache, making a repeated query reparse nothing that is cached.
+        """
+        indices = self._cache_get(self._name_index_cache, name)
+        if indices is None:
+            indices = self._indices_by_name(name)
+            self._cache_put(self._name_index_cache, name, indices,
+                            self.max_cached_name_lookups)
+        if not indices:
+            return None
+        return [self._cached_symbol(i) for i in indices]
+
+    def iter_symbols(self, start: int = 0, stop: int | None = None) -> Iterator[Symbol]:
+        """ Yield symbols lazily, one entry at a time.
+
+            With the optional range, only entries ``[start, stop)`` are parsed;
+            nothing outside the range is read. The iterator keeps no stream
+            cursor of its own, so several iterators over the same file (or the
+            same section) can be interleaved without disturbing each other.
+
+            Iteration does not populate the LRU caches, so walking a table of
+            millions of entries has constant memory cost.
+        """
+        count = self.num_symbols()
+        if stop is None:
+            stop = count
+        start = max(0, start)
+        stop = min(stop, count)
+        for i in range(start, stop):
+            yield self._parse_symbol(i)
 
 
 class SymbolTableIndexSection(Section):
@@ -206,9 +654,14 @@ class SymbolTableIndexSection(Section):
                             self['sh_offset'] + n * self['sh_entsize'])
 
 
-class SymbolTableSection(Section):
+class SymbolTableSection(_BoundedSymbolAccess, Section):
     """ ELF symbol table section. Has an associated StringTableSection that's
         passed in the constructor.
+
+        Access is bounded-memory: entries are parsed on demand, iteration
+        streams, and name lookups only parse the entries they return. The
+        bounds are per-instance class attributes; set them before creating the
+        section or on the class to suit the workload.
     """
     def __init__(
         self,
@@ -223,44 +676,33 @@ class SymbolTableSection(Section):
                 f'Expected entry size of section {name!r} to be > 0')
         elf_assert(self['sh_size'] % self['sh_entsize'] == 0,
                 f'Expected section size to be a multiple of entry size in section {name!r}')
+        self._init_symbol_caches()
 
     def num_symbols(self) -> int:
         """ Number of symbols in the table
         """
         return self['sh_size'] // self['sh_entsize']
 
-    def get_symbol(self, n: int) -> Symbol:
-        """ Get the symbol at index #n from the table (Symbol object)
-        """
-        # Grab the symbol's entry from the stream
-        entry_offset = self['sh_offset'] + n * self['sh_entsize']
-        entry = struct_parse(
-            self.structs.Elf_Sym,
-            self.stream,
-            stream_pos=entry_offset)
-        # Find the symbol name in the associated string table
-        name = self.stringtable.get_string(entry['st_name'])
-        return Symbol(entry, name)
+    def _symbol_table_bounds(self) -> tuple[int, int]:
+        return self['sh_offset'], self['sh_size']
 
-    def get_symbol_by_name(self, name: str) -> list[Symbol] | None:
-        """ Get a symbol(s) by name. Return None if no symbol by the given name
-            exists.
-        """
-        symnums = self._symbol_name_map.get(name)
-        return [self.get_symbol(i) for i in symnums] if symnums else None
+    def _symbol_entry_size(self) -> int:
+        return int(self['sh_entsize'])
 
-    @cached_property
-    def _symbol_name_map(self) -> dict[str, list[int]]:
-        smap = defaultdict(list)
-        for i, sym in enumerate(self.iter_symbols()):
-            smap[sym.name].append(i)
-        return smap
+    def _symbol_struct(self) -> Any:
+        return self.structs.Elf_Sym
 
-    def iter_symbols(self) -> Iterator[Symbol]:
-        """ Yield all the symbols in the table
-        """
-        for i in range(self.num_symbols()):
-            yield self.get_symbol(i)
+    def _symbol_structs(self) -> ELFStructs:
+        return self.structs
+
+    def _symbol_stream(self) -> IO[bytes]:
+        return self.stream
+
+    def _symbol_stream_owner(self) -> Any:
+        return self.elffile
+
+    def _symbol_stringtable(self) -> StringTableSection:
+        return self.stringtable
 
 
 class Symbol:

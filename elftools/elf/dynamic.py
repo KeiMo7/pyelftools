@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import itertools
-from collections import defaultdict
 from functools import cached_property
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
@@ -18,7 +17,7 @@ from ..common.utils import elf_assert, parse_cstring_from_stream, struct_parse
 from .enums import ENUM_D_TAG
 from .hash import ELFHashTable, GNUHashTable
 from .relocation import RelocationTable, RelrRelocationTable
-from .sections import Section, Symbol
+from .sections import Section, Symbol, _BoundedSymbolAccess, _shared_stream_lock
 from .segments import Segment
 
 if TYPE_CHECKING:
@@ -56,7 +55,8 @@ class _DynamicStringTable:
     def get_string(self, offset: int) -> str:
         """ Get the string stored at the given offset in this string table.
         """
-        s = parse_cstring_from_stream(self._stream, self._table_offset + offset)
+        with _shared_stream_lock(self._stream):
+            s = parse_cstring_from_stream(self._stream, self._table_offset + offset)
         return s.decode('utf-8', errors='replace') if s else ''
 
 
@@ -283,7 +283,7 @@ class DynamicSection(Section, Dynamic):
             self['sh_offset'], self['sh_type'] == 'SHT_NOBITS')
 
 
-class DynamicSegment(Segment, Dynamic):
+class DynamicSegment(Segment, Dynamic, _BoundedSymbolAccess):
     """ ELF dynamic table segment.  Knows how to process the list of tags.
     """
     def __init__(self, header: Container, stream: IO[bytes], elffile: ELFFile) -> None:
@@ -305,6 +305,7 @@ class DynamicSegment(Segment, Dynamic):
         Dynamic.__init__(self, stream, elffile, stringtable, self['p_offset'],
              self['p_filesz'] == 0)
         self._symbol_size = self.elfstructs.Elf_Sym.sizeof()
+        self._init_symbol_caches()
 
     def num_symbols(self) -> int:
         """ Number of symbols in the table recovered from DT_SYMTAB
@@ -365,42 +366,54 @@ class DynamicSegment(Segment, Dynamic):
 
         raise ELFError('Cannot determine the end of DT_SYMTAB.')
 
-    def get_symbol(self, index: int) -> Symbol:
-        """ Get the symbol at index #index from the table (Symbol object)
-        """
+    # -- Hooks for _BoundedSymbolAccess -------------------------------------
+
+    def _symbol_table_bounds(self) -> tuple[int, int]:
         tab_ptr, tab_offset = self.get_table_offset('DT_SYMTAB')
         if tab_ptr is None or tab_offset is None:
             raise ELFError('Segment does not contain DT_SYMTAB.')
+        return tab_offset, self.num_symbols() * self._symbol_size
 
-        symbol = struct_parse(
-            self.elfstructs.Elf_Sym,
-            self._stream,
-            stream_pos=tab_offset + index * self._symbol_size)
+    def _symbol_entry_size(self) -> int:
+        return self._symbol_size
 
-        string_table = self._get_stringtable()
-        symbol_name = string_table.get_string(symbol["st_name"])
+    def _symbol_struct(self) -> Any:
+        return self.elfstructs.Elf_Sym
 
-        return Symbol(symbol, symbol_name)
+    def _symbol_structs(self) -> Any:
+        return self.elfstructs
 
-    def get_symbol_by_name(self, name: str) -> list[Symbol] | None:
-        """ Get a symbol(s) by name. Return None if no symbol by the given name
-            exists.
+    def _symbol_stream(self) -> IO[bytes]:
+        return self._stream
+
+    def _symbol_stream_owner(self) -> Any:
+        return self.elffile
+
+    def _symbol_stringtable(self) -> _StringTable:
+        return self._get_stringtable()
+
+    def get_symbol(self, index: int) -> Symbol:
+        """ Get the symbol at index #index from the table (Symbol object).
+
+            Entries are parsed on request and recently used ones are kept in a
+            bounded LRU cache.
         """
-        symnums = self._symbol_name_map.get(name)
-        return [self.get_symbol(i) for i in symnums] if symnums else None
+        if not 0 <= index < self.num_symbols():
+            raise IndexError(index)
+        return self._cached_symbol(index)
 
-    @cached_property
-    def _symbol_name_map(self) -> dict[str, list[int]]:
-        smap = defaultdict(list)
-        for i, sym in enumerate(self.iter_symbols()):
-            smap[sym.name].append(i)
-        return smap
+    def iter_symbols(self, start: int = 0, stop: int | None = None) -> Iterator[Symbol]:
+        """ Yield symbols in this dynamic segment, lazily.
 
-    def iter_symbols(self) -> Iterator[Symbol]:
-        """ Yield all symbols in this dynamic segment. The symbols are usually
-            the same as returned by SymbolTableSection.iter_symbols. However,
-            in stripped binaries, SymbolTableSection might have been removed.
-            This method reads from the mandatory dynamic tag DT_SYMTAB.
+            The symbols are usually the same as returned by
+            SymbolTableSection.iter_symbols. However, in stripped binaries,
+            SymbolTableSection might have been removed. This method reads from
+            the mandatory dynamic tag DT_SYMTAB.
+
+            With the optional range, only entries ``[start, stop)`` are parsed.
         """
-        for i in range(self.num_symbols()):
-            yield self.get_symbol(i)
+        count = self.num_symbols()
+        if stop is None:
+            stop = count
+        for i in range(max(0, start), min(stop, count)):
+            yield self._parse_symbol(i)

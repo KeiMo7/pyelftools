@@ -126,6 +126,45 @@ interacting with the symbol table. There are other special sections
 the same file) and `RelocationSection` (in
 `elftools/elf/relocation.py`).
 
+### Symbol tables
+
+Symbol tables in real builds routinely hold millions of entries, while an
+analysis usually needs only a handful of them. `SymbolTableSection` (and
+`DynamicSegment`, for stripped files) therefore reads symbols on demand:
+nothing about the table's size is held in memory unless the caller asks for
+it.
+
+* `iter_symbols([start, stop])` streams entries one at a time. With a range
+  only the entries inside it are read. Several iterators over the same file
+  can be interleaved; each keeps its own position and none of them moves the
+  stream cursor for another.
+* `get_symbol(n)` parses one entry and keeps it in a bounded LRU cache.
+* `get_symbol_by_name(name)` scans the table's `st_name` fields only; entries
+  whose name matches are parsed, and only the strings they reference are read
+  from the string table (scanned in bounded chunks, never loaded whole). The
+  resulting index list is kept in a bounded LRU cache, so asking twice for the
+  same name parses nothing that is still cached. A name that occurs more than
+  once returns all its entries, in table order.
+
+The bounds are class attributes, so they can be tuned per workload:
+
+```python
+symtab.max_cached_symbols = 1000        # parsed entries kept in memory
+symtab.max_cached_name_lookups = 256    # name -> indices results kept
+symtab.max_name_candidates = 100_000    # matches one query may collect
+```
+
+`cache_stats()` reports current occupancy and the limits, and
+`clear_cache()` releases everything a traversal has cached - call it when a
+scan exits early so the memory does not carry into the next analysis.
+
+Memory bounds are never enforced by dropping results. If a query would need
+more than its configured limit, `ELFMemoryLimitError` is raised; its
+`category` attribute says which kind of data hit the limit (`'symbols'` or
+`'symbol-names'`). A corrupt entry or an out-of-range `st_name` raises
+`ELFSymbolError`, a subclass of `ELFParseError`, whose `index` attribute is
+the entry's index in the table.
+
 ### ELF segments
 
 Similarly to sections, an ELF segment has a class in **pyelftools** to
