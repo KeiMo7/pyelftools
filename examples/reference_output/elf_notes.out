@@ -11,3 +11,7 @@ Processing file: ./examples/sample_exe64.elf
     Name: GNU
     Type: NT_GNU_BUILD_ID
     Desc: 8e50cda8e25993499ac4aa2d8deaf58d0949d47d
+  Note index:
+    seq=0 section[2] #0 GNU NT_GNU_ABI_TAG
+    seq=1 section[3] #0 SuSE 1163097427
+    seq=2 section[4] #0 GNU NT_GNU_BUILD_ID

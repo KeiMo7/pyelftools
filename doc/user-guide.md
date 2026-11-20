@@ -135,6 +135,29 @@ count and enumerate them. There are also some special segment classes
 that have more information about well-known segments. Take a look at
 `elftools/elf/segments.py` for more details.
 
+### ELF notes
+
+The classic per-range API is `NoteSection.iter_notes()` and
+`NoteSegment.iter_notes()`. For core dumps with notes spread over several
+segments, `ELFFile.note_index()` returns a `NoteIndex` that:
+
+- yields every note in a stable global order, with immutable provenance
+  (`source`, `index_in_source`, `sequence`);
+- reads only note headers and owner names up front; descriptors are read
+  and decoded on demand with `NoteRecord.read()`, so memory does not grow
+  with the total descriptor size;
+- groups per-thread notes (`NT_PRSTATUS` and `NT_FPREGSET`) through
+  `iter_thread_groups()`, keyed by a stable `ThreadNoteKey` (the `pr_pid`
+  when available);
+- reports incomplete notes instead of stopping silently. `NoteIndex.truncations`
+  contains `NoteTruncationInfo` entries whose `truncation` is
+  `NoteTruncation.HEADER`, `NAME` or `DESCRIPTOR`, along with the consumed
+  byte count.
+
+Unknown owners and types, malformed descriptors and duplicate thread notes
+are all preserved; see the `NoteRecord`, `ThreadNoteGroup` and
+`NoteTruncationInfo` docstrings for details.
+
 ### Structs and headers
 
 Most objects in ELF and DWARF have \"headers\", and such objects usually

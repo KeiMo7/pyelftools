@@ -25,6 +25,7 @@ from .constants import SHN_INDICES
 from .dynamic import DynamicSection, DynamicSegment
 from .gnuversions import GNUVerDefSection, GNUVerNeedSection, GNUVerSymSection
 from .hash import ELFHashSection, GNUHashSection
+from .notes import NoteIndex
 from .relocation import RelocationHandler, RelocationSection, RelrRelocationSection
 from .sections import (
     ARMAttributesSection,
@@ -215,6 +216,16 @@ class ELFFile:
         """ Section existence check by name, without the overhead of parsing if found.
         """
         return section_name in self._section_name_map
+
+    def note_index(self) -> NoteIndex:
+        """ Return a lazy index over all notes in the file.
+
+        The index orders notes from every note section and note segment,
+        records each note's provenance, exposes per-thread groups, and reports
+        truncations instead of silently stopping.  Descriptors are read on
+        demand, so indexing does not depend on their total size.
+        """
+        return NoteIndex(self)
 
     def iter_sections(self, type: str | None = None) -> Iterator[Section]:
         """ Yield all the sections in the file. If the optional |type|

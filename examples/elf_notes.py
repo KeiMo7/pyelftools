@@ -2,7 +2,8 @@
 # elftools example: elf_notes.py
 #
 # An example of obtaining note sections from an ELF file and examining
-# the notes it contains.
+# the notes it contains. It also shows the lazy, provenance-aware note index
+# that is useful for core dumps.
 #
 # Eli Bendersky (eliben@gmail.com)
 # This code is in the public domain
@@ -13,10 +14,22 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import NoteSection
 
 
+def describe_desc(note):
+    desc = note['n_desc']
+    if note['n_type'] == 'NT_GNU_ABI_TAG':
+        return (
+            f"{desc['abi_os']}, ABI: {desc['abi_major']:d}."
+            f"{desc['abi_minor']:d}.{desc['abi_tiny']:d}")
+    if note['n_type'] in {'NT_GNU_BUILD_ID', 'NT_GNU_GOLD_VERSION'}:
+        return desc
+    return bytes(desc).hex()
+
+
 def process_file(filename):
     print('Processing file:', filename)
     with open(filename, 'rb') as f:
-        for sect in ELFFile(f).iter_sections():
+        elf = ELFFile(f)
+        for sect in elf.iter_sections():
             if not isinstance(sect, NoteSection):
                 continue
             print(
@@ -27,17 +40,21 @@ def process_file(filename):
             for note in sect.iter_notes():
                 print('    Name:', note['n_name'])
                 print('    Type:', note['n_type'])
-                desc = note['n_desc']
-                if note['n_type'] == 'NT_GNU_ABI_TAG':
-                    print(
-                        f"    Desc: {desc['abi_os']}, ABI: "
-                        f"{desc['abi_major']:d}.{desc['abi_minor']:d}."
-                        f"{desc['abi_tiny']:d}"
-                    )
-                elif note['n_type'] in {'NT_GNU_BUILD_ID', 'NT_GNU_GOLD_VERSION'}:
-                    print('    Desc:', desc)
-                else:
-                    print('    Desc:', bytes(desc).hex())
+                print('    Desc:', describe_desc(note))
+
+        # The note index covers every note section/segment and records where
+        # each note came from. Descriptors are only read when accessed, so
+        # this works the same for small objects and multi-gigabyte cores.
+        print('  Note index:')
+        index = elf.note_index()
+        for record in index.iter_records():
+            print(
+                f"    seq={record.sequence} "
+                f"{record.source.kind}[{record.source.index}] "
+                f"#{record.index_in_source} "
+                f"{record.name} {record.n_type}")
+        for info in index.truncations:
+            print('    Incomplete:', info)
 
 
 if __name__ == '__main__':
